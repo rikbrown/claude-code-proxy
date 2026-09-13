@@ -1703,6 +1703,20 @@ async fn dispatch_request(
         .ok()
         .flatten()
         .map(str::to_string);
+    if !count_tokens {
+        // Diagnostic: the compaction detector's verdict and every input it
+        // reads, as metadata only. Logged at the boundary, before any provider
+        // rewrite, so a "/compact that was not treated as compaction" can be
+        // explained from the log alone.
+        let mut fields = crate::providers::codex::compact_request_signals(&body);
+        fields.insert("reqId".into(), json!(&req_id));
+        fields.insert("sessionId".into(), json!(&session_id));
+        fields.insert("provider".into(), json!(provider.name()));
+        fields.insert("model".into(), json!(&normalized_model));
+        fields.insert("effort".into(), json!(&effort));
+        fields.insert("stream".into(), json!(body.stream));
+        log.info("compact_request_signals", Some(fields));
+    }
     let current = session::record_session_request_with_affinity_update(
         session_id.as_deref(),
         session_state.as_ref(),
