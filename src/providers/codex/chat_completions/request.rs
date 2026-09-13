@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 
 use crate::providers::codex::translate::{
     model_allowlist::{
-        ALLOWED_MODELS, assert_allowed_model, resolve_model_request, uses_responses_lite,
+        ALLOWED_MODELS, assert_allowed_model, request_uses_responses_lite, resolve_model_request,
     },
     request::{Effort, resolve_effort_override, to_codex_effort},
 };
@@ -61,7 +61,7 @@ fn translate_request_with_override(
             Some("model_not_supported"),
         )
     })?;
-    let use_responses_lite = uses_responses_lite(&resolved.model);
+    let use_responses_lite = request_uses_responses_lite(&resolved.model);
 
     let messages = object
         .get("messages")

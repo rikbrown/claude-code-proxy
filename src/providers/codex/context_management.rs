@@ -308,7 +308,15 @@ pub fn capture_context_blob(
     // content and the explicit tail) plus the output emitted before it.
     checked.extend(tail.iter().map(item_digest));
     checked.extend(output_items.iter().map(item_digest));
-    stripped += tail.len() + compaction.covered_output_items;
+    // A function_call stays explicit even when the blob covers it: the next
+    // request carries its function_call_output, and the backend rejects an
+    // output whose call is only inside the blob with 400 ("No tool call
+    // found for function call output with call_id ...").
+    let first_call = output_items
+        .iter()
+        .position(|item| matches!(item, ResponsesInputItem::FunctionCall { .. }))
+        .unwrap_or(output_items.len());
+    stripped += tail.len() + compaction.covered_output_items.min(first_call);
 
     if compaction.encrypted_content.len() > MAX_BLOB_BYTES || checked.len() > MAX_COVERED_ITEMS {
         remove_state(registry, owner);
@@ -783,6 +791,31 @@ mod tests {
     }
 
     #[test]
+    fn covered_function_call_stays_explicit() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        let call = json!({"type":"function_call","call_id":"call-1","name":"Read","arguments":"{\"path\":\"a\"}"});
+        assert_eq!(
+            captured_with_output(
+                json!([user("one")]),
+                std::slice::from_ref(&call),
+                1,
+                "blob-1"
+            ),
+            CaptureOutcome::Captured {
+                checked_items: 2,
+                stripped_items: 1,
+                blob_bytes: 6,
+                chained: false
+            }
+        );
+        let output = json!({"type":"function_call_output","call_id":"call-1","output":"contents"});
+        let next = request(json!([user("one"), call.clone(), output.clone()]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &next));
+        assert_eq!(input, vec![compaction("blob-1"), call, output]);
+    }
+
+    #[test]
     fn blob_before_output_leaves_output_explicit() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_context_management_for_tests();
@@ -794,9 +827,10 @@ mod tests {
                 1,
                 "blob-1"
             ),
+            // The covered call is checked but stays explicit on the wire.
             CaptureOutcome::Captured {
                 checked_items: 3,
-                stripped_items: 2,
+                stripped_items: 1,
                 blob_bytes: 6,
                 chained: false
             }
@@ -810,7 +844,12 @@ mod tests {
         let input = replay_input(apply_context_replay(Some(&owner()), &next));
         assert_eq!(
             input,
-            vec![compaction("blob-1"), assistant("two"), user("three")]
+            vec![
+                compaction("blob-1"),
+                call.clone(),
+                assistant("two"),
+                user("three")
+            ]
         );
 
         // The explicit reply is still checked: a different one discards.
