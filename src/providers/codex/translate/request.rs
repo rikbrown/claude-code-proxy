@@ -698,7 +698,11 @@ fn translate_request_inner(
         if let Some(ref tier) = service_tier {
             out.service_tier = Some(tier.clone());
         }
-        if config::codex_context_management() {
+        // The Responses Lite lane rejects server-side compaction outright
+        // ("X-OpenAI-Internal-Codex-Responses-Lite does not support
+        // server-side compaction"), so the field is only sent on the full
+        // lane. Capture and replay key off this field being present.
+        if config::codex_context_management() && !opts.use_responses_lite {
             out.context_management = Some(vec![ContextManagementEntry::Compaction {
                 compact_threshold: config::codex_context_management_threshold(),
             }]);

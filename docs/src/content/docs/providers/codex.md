@@ -110,9 +110,15 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 ## Context management
 
-Codex can also compact a conversation on the server while it answers. With context management enabled, every Codex request carries `context_management` with a `compaction` entry and a token threshold. When the rendered window crosses that threshold, Codex compacts mid-stream and returns an opaque encrypted `compaction` item alongside the normal answer. Unlike server compaction, this needs no extra request and does not wait for a Claude Code compaction boundary.
+Codex can also compact a conversation on the server while it answers. With context management enabled, a Codex request on the full Responses lane carries `context_management` with a `compaction` entry and a token threshold. When the rendered window crosses that threshold, Codex compacts mid-stream and returns an opaque encrypted `compaction` item alongside the normal answer. Unlike server compaction, this needs no extra request and does not wait for a Claude Code compaction boundary.
 
-The proxy keeps the last `compaction` item from a completed turn in memory for that conversation owner and model. On the next turn, if the translated input is an append-only extension of the history the item covers, the proxy sends the item in place of that history and keeps the newer items in full. Claude Code still sends its complete history; only the upstream request is shortened. The item covers the input of the turn that produced it, so that turn's own reply is sent again rather than lost.
+:::caution
+The Responses Lite lane rejects server-side compaction (`X-OpenAI-Internal-Codex-Responses-Lite does not support server-side compaction`). The proxy serves `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-6-astra` on that lane, so context management is unavailable on the default `gpt-5.6-*` and `gpt-6-*` routes. Requests for those models are sent without `context_management`, and no compaction item is captured or replayed for them. Only full-lane models such as `gpt-5.5` use the feature. A `context_management_unsupported_lane` log event is written once per process when the feature is enabled but the request runs on the Lite lane.
+:::
+
+The proxy keeps the last `compaction` item from a completed turn in memory for that conversation owner and model, together with a record of exactly what it covers. A `compaction` item emitted after some of the turn's output items contains those items as well as the request input, so the covered history is the request's conversation items followed by the output items (assistant text, tool calls, and reasoning) that were emitted before the item. Output emitted after the item is not covered and stays explicit. On the next turn, if the translated input starts with exactly that covered history and continues from there, the proxy sends the item in place of the covered history and keeps only what follows in full. Claude Code still sends its complete history; only the upstream request is shortened.
+
+If the proxy cannot establish what a `compaction` item covers, for example because the item cannot be positioned against the turn's output, it stores nothing and the next turn sends the full history.
 
 ### Enable context management
 
@@ -137,9 +143,9 @@ CCP_CODEX_CONTEXT_MANAGEMENT=1 claude-code-proxy serve
 
 ### Fallbacks and visibility
 
-Replay requires the same conversation owner, Codex model, system prompt, tools, and request shape, with append-only history. A branch, edited history, provider or model change, proxy restart, memory limit, or 30 minutes without matching activity discards the stored item and sends the full history. The item is never combined with a server compaction replay in one request. State is held only in memory and is lost when the proxy restarts.
+Replay requires the same conversation owner, Codex model, system prompt, tools, and request shape, and the conversation must begin with exactly the covered history. A branch, an edited or regenerated assistant reply, a provider or model change, a proxy restart, a memory limit, or 30 minutes without matching activity discards the stored item and sends the full history. When two turns for the same conversation overlap, only the newest may store an item, so a slower older turn cannot install an item that a newer history then matches. The item is never combined with a server compaction replay in one request. State is held only in memory and is lost when the proxy restarts. With `CCP_TRAFFIC_LOG=1`, traffic captures record the encrypted `compaction` item together with the rest of the upstream request and response, as they do for prompt text and tool output.
 
-Structured log events named `context_management_blob_captured`, `context_management_replayed`, and `context_management_discarded` report each capture, replay, and discard with counts and reasons only.
+Structured log events named `context_management_blob_captured`, `context_management_replayed`, `context_management_discarded`, `context_management_capture_refused`, and `context_management_capture_superseded` report each capture, replay, discard, and refusal with counts and reasons only.
 
 ## OpenAI-compatible APIs
 

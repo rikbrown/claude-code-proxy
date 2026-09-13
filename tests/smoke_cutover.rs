@@ -1504,7 +1504,8 @@ async fn smoke_codex_http_context_management_replays_compaction_blob() {
                 requests.len()
             };
             // Only the first turn crosses the threshold: two compaction items
-            // bracket the answer, and the last one must win.
+            // bracket the answer. The last one wins, and because it was
+            // emitted after the message it covers that message too.
             let (leading_compaction, trailing_compaction) = if request_number == 1 {
                 (
                     "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-1\"}}\n\n",
@@ -1532,8 +1533,10 @@ async fn smoke_codex_http_context_management_replays_compaction_blob() {
     let _context_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "1");
     let _threshold_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD", "5000");
 
+    // gpt-5.5 runs on the full Responses lane; every gpt-5.6-* and gpt-6-*
+    // model uses Responses Lite, where server-side compaction is rejected.
     let first = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.5",
         "max_tokens": 64,
         "system": "instructions",
         "messages": [{"role":"user","content":"old conversation"}]
@@ -1542,7 +1545,7 @@ async fn smoke_codex_http_context_management_replays_compaction_blob() {
     assert_eq!(first.status(), StatusCode::OK);
 
     let second = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.5",
         "max_tokens": 64,
         "system": "instructions",
         "messages": [
@@ -1561,17 +1564,20 @@ async fn smoke_codex_http_context_management_replays_compaction_blob() {
     .unwrap();
     assert_eq!(value["content"][0]["text"], "reply 2");
 
-    let branched = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
+    // The client kept a different first reply: the blob holds "reply 1", so
+    // it must not be replayed under an edited history.
+    let edited = call_messages_body(json!({
+        "model": "gpt-5.5",
         "max_tokens": 64,
         "system": "instructions",
         "messages": [
-            {"role":"user","content":"different conversation"},
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":"reply edited"},
             {"role":"user","content":"continue"}
         ]
     }))
     .await;
-    assert_eq!(branched.status(), StatusCode::OK);
+    assert_eq!(edited.status(), StatusCode::OK);
 
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 3);
@@ -1598,14 +1604,94 @@ async fn smoke_codex_http_context_management_replays_compaction_blob() {
     assert_eq!(compaction["encrypted_content"], "blob-2");
     assert!(!requests[1].to_string().contains("blob-1"));
     assert!(!requests[1].to_string().contains("old conversation"));
-    assert!(requests[1].to_string().contains("instructions"));
-    assert!(requests[1].to_string().contains("reply 1"));
+    // "reply 1" was emitted before blob-2, so it is inside the blob and must
+    // not be sent again explicitly.
+    assert!(!requests[1].to_string().contains("reply 1"));
     assert!(requests[1].to_string().contains("continue"));
-    assert_eq!(replay[0]["role"], "developer");
-    assert_eq!(replay[1]["type"], "compaction");
+    assert_eq!(replay.len(), 2);
+    assert_eq!(replay[0]["type"], "compaction");
+    assert_eq!(replay[1]["role"], "user");
 
     assert!(!has_compaction_item(&requests[2]));
-    assert!(requests[2].to_string().contains("different conversation"));
+    assert!(requests[2].to_string().contains("old conversation"));
+    assert!(requests[2].to_string().contains("reply edited"));
+    clear_all_context_management_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_context_management_is_off_on_responses_lite() {
+    let _guard = env_lock();
+    clear_all_context_management_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let request_number = {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            // Even if a Lite response somehow carried a compaction item, the
+            // proxy must not keep it.
+            format!(
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
+                 data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"reply {request_number}\"}}\n\n\
+                 data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                 data: {{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"blob-lite\"}}}}\n\n\
+                 data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{request_number}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+            )
+            .into_bytes()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _context_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "instructions",
+        "messages": [{"role":"user","content":"old conversation"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "instructions",
+        "messages": [
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":"reply 1"},
+            {"role":"user","content":"continue"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.get("context_management").is_none());
+        assert!(
+            !request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "compaction")
+        );
+    }
+    assert!(requests[1].to_string().contains("old conversation"));
+    assert!(requests[1].to_string().contains("reply 1"));
+    assert!(!requests[1].to_string().contains("blob-lite"));
     clear_all_context_management_for_tests();
 }
 
