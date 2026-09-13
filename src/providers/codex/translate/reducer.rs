@@ -135,8 +135,9 @@ pub enum ReducerEvent {
 pub struct CompactionOutput {
     pub encrypted_content: String,
     /// How many leading entries of `output_items` were emitted before the
-    /// compaction item. The blob stands for those items too; anything emitted
-    /// after it is not inside the blob and must stay explicit.
+    /// compaction item. The blob is known to hold those; it may also hold
+    /// items emitted after it (observed live for a blob at output_index 0),
+    /// so this is a lower bound on coverage, never an upper bound.
     pub covered_output_items: usize,
 }
 
@@ -714,10 +715,11 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("compaction")
             {
                 // Several compaction items can arrive in one turn; the last
-                // one covers the most history, including every output item
-                // emitted before it. An item without an output_index, or one
-                // that arrives out of order, cannot be positioned, so the
-                // turn's compaction is dropped rather than guessed.
+                // one covers the most history, including at least every
+                // output item emitted before it. An item without an
+                // output_index, or one that arrives out of order, cannot be
+                // positioned, so the turn's compaction is dropped rather than
+                // guessed.
                 let encrypted_content = item_val
                     .get("encrypted_content")
                     .and_then(|v| v.as_str())
