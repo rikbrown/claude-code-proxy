@@ -347,13 +347,152 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
         })
 }
 
-/// Reasoning-effort cap applied to compaction requests, or None when the
-/// fast path is disabled. Summarization is extraction, not problem solving:
-/// native Claude Code compacts without extended thinking, so burning
-/// medium/high reasoning on a 200k-token summary only adds latency. The cap
-/// never raises effort — a request already below it is left alone.
-fn compact_effort_cap() -> Option<Effort> {
+/// Text of every text-bearing part of a message: the string itself, or the
+/// `text` of each `text` block. Non-text blocks (tool results, images) are
+/// skipped, so an empty result means "no text to inspect".
+fn message_texts(content: &Value) -> Vec<&str> {
+    match content {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Where the compaction markers sit inside one message. Each flag is a
+/// boolean over the message's text parts; no text leaves this function.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CompactMarkerPlacement {
+    text_blocks: usize,
+    prefix: bool,
+    task: bool,
+    /// Both markers inside one text part: what the detector requires.
+    same_block: bool,
+}
+
+impl CompactMarkerPlacement {
+    fn of(content: &Value) -> Self {
+        let texts = message_texts(content);
+        Self {
+            text_blocks: texts.len(),
+            prefix: texts
+                .iter()
+                .any(|text| text.contains(COMPACT_MESSAGE_PREFIX)),
+            task: texts.iter().any(|text| text.contains(COMPACT_MESSAGE_TASK)),
+            same_block: texts.iter().any(|text| is_compact_message_text(text)),
+        }
+    }
+
+    /// Both markers present, but never together in one text part.
+    fn split_blocks(self) -> bool {
+        self.prefix && self.task && !self.same_block
+    }
+}
+
+/// Metadata-only signals that say WHY a request did or did not trip
+/// `is_compact_messages_request`: the detector verdict next to each input it
+/// depends on, plus the near-miss shapes it deliberately rejects (markers
+/// split across text blocks, markers in an earlier message). Booleans, counts
+/// and roles only — no prompt text, so it is safe to log for every request.
+pub(crate) fn compact_request_signals(request: &MessagesRequest) -> serde_json::Map<String, Value> {
+    let system_marker =
+        is_compact_request(flatten_system_text(request.extra.get("system")).as_deref());
+    let last = request.messages.last();
+    let last_placement = last
+        .map(|message| CompactMarkerPlacement::of(&message.content))
+        .unwrap_or_default();
+    // Nearest earlier message whose text carries both markers in one block,
+    // reported as a distance from the end so a log line stands on its own.
+    let earlier = request
+        .messages
+        .iter()
+        .rev()
+        .skip(1)
+        .enumerate()
+        .map(|(offset, message)| {
+            (
+                offset + 1,
+                message,
+                CompactMarkerPlacement::of(&message.content),
+            )
+        })
+        .find(|(_, _, placement)| placement.prefix || placement.task);
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "detector".into(),
+        json_bool(is_compact_messages_request(request)),
+    );
+    fields.insert("systemMarker".into(), json_bool(system_marker));
+    fields.insert("messageCount".into(), Value::from(request.messages.len()));
+    fields.insert(
+        "lastRole".into(),
+        last.map(|message| Value::String(message.role.clone()))
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "lastContentIsString".into(),
+        json_bool(last.is_some_and(|message| message.content.is_string())),
+    );
+    fields.insert(
+        "lastTextBlocks".into(),
+        Value::from(last_placement.text_blocks),
+    );
+    fields.insert("lastPrefixMarker".into(), json_bool(last_placement.prefix));
+    fields.insert("lastTaskMarker".into(), json_bool(last_placement.task));
+    fields.insert(
+        "lastMarkersSameBlock".into(),
+        json_bool(last_placement.same_block),
+    );
+    fields.insert(
+        "lastMarkersSplitBlocks".into(),
+        json_bool(last_placement.split_blocks()),
+    );
+    fields.insert(
+        "earlierMarkerOffsetFromEnd".into(),
+        earlier
+            .map(|(offset, _, _)| Value::from(offset))
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "earlierMarkerRole".into(),
+        earlier
+            .map(|(_, message, _)| Value::String(message.role.clone()))
+            .unwrap_or(Value::Null),
+    );
+    fields.insert(
+        "earlierPrefixMarker".into(),
+        json_bool(earlier.is_some_and(|(_, _, placement)| placement.prefix)),
+    );
+    fields.insert(
+        "earlierTaskMarker".into(),
+        json_bool(earlier.is_some_and(|(_, _, placement)| placement.task)),
+    );
+    fields.insert(
+        "earlierMarkersSameBlock".into(),
+        json_bool(earlier.is_some_and(|(_, _, placement)| placement.same_block)),
+    );
+    fields
+}
+
+fn json_bool(value: bool) -> Value {
+    Value::Bool(value)
+}
+
+/// Compaction effort cap. Missing effort defaults to the cap; an explicitly
+/// lower effort is preserved. `None` (CCP_COMPACT_EFFORT=off) disables the cap.
+pub(crate) fn compact_effort_cap() -> Option<Effort> {
     compact_effort_cap_from(std::env::var("CCP_COMPACT_EFFORT").ok().as_deref())
+}
+
+fn apply_compact_effort_cap(resolved: Option<Effort>, cap: Option<Effort>) -> Option<Effort> {
+    match (resolved, cap) {
+        (resolved, None) => resolved,
+        (Some(effort), Some(cap)) if effort <= cap => Some(effort),
+        (_, Some(cap)) => Some(cap),
+    }
 }
 
 fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
@@ -559,12 +698,8 @@ fn translate_request_inner(
     } else {
         codex_effort
     };
-    if apply_codex_config
-        && is_compact
-        && let Some(cap) = compact_effort_cap()
-        && resolved_effort.as_ref().is_some_and(|e| *e > cap)
-    {
-        resolved_effort = Some(cap);
+    if apply_codex_config && is_compact {
+        resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
@@ -1833,6 +1968,119 @@ mod tests {
         assert!(is_compact_messages_request(&req));
     }
 
+    fn compact_signals(
+        messages: serde_json::Value,
+        system: &str,
+    ) -> serde_json::Map<String, Value> {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-astra",
+            "messages": messages,
+            "system": system
+        }))
+        .unwrap();
+        compact_request_signals(&req)
+    }
+
+    const COMPACT_PROMPT: &str = concat!(
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+        "Your task is to create a detailed summary of the conversation so far."
+    );
+
+    #[test]
+    fn compact_signals_explain_a_genuine_compact_request() {
+        let signals = compact_signals(
+            json!([
+                {"role": "user", "content": "prior turn"},
+                {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "result"},
+                    {"type": "text", "text": COMPACT_PROMPT}
+                ]}
+            ]),
+            "You are Claude Code.",
+        );
+        assert_eq!(signals["detector"], json!(true));
+        assert_eq!(signals["systemMarker"], json!(false));
+        assert_eq!(signals["messageCount"], json!(3));
+        assert_eq!(signals["lastRole"], json!("user"));
+        assert_eq!(signals["lastContentIsString"], json!(false));
+        assert_eq!(signals["lastTextBlocks"], json!(1));
+        assert_eq!(signals["lastMarkersSameBlock"], json!(true));
+        assert_eq!(signals["lastMarkersSplitBlocks"], json!(false));
+        assert_eq!(signals["earlierMarkerOffsetFromEnd"], Value::Null);
+        assert_eq!(signals["earlierMarkersSameBlock"], json!(false));
+    }
+
+    #[test]
+    fn compact_signals_flag_markers_split_across_text_blocks() {
+        let signals = compact_signals(
+            json!([{"role": "user", "content": [
+                {"type": "text", "text": "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."},
+                {"type": "text", "text": "Your task is to create a detailed summary of the conversation so far."}
+            ]}]),
+            "You are Claude Code.",
+        );
+        assert_eq!(signals["detector"], json!(false));
+        assert_eq!(signals["lastTextBlocks"], json!(2));
+        assert_eq!(signals["lastPrefixMarker"], json!(true));
+        assert_eq!(signals["lastTaskMarker"], json!(true));
+        assert_eq!(signals["lastMarkersSameBlock"], json!(false));
+        assert_eq!(signals["lastMarkersSplitBlocks"], json!(true));
+    }
+
+    #[test]
+    fn compact_signals_locate_markers_in_an_earlier_message() {
+        let signals = compact_signals(
+            json!([
+                {"role": "user", "content": "prior turn"},
+                {"role": "user", "content": COMPACT_PROMPT},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "result"}]}
+            ]),
+            "You are Claude Code.",
+        );
+        assert_eq!(signals["detector"], json!(false));
+        assert_eq!(signals["lastRole"], json!("user"));
+        assert_eq!(signals["lastTextBlocks"], json!(0));
+        assert_eq!(signals["lastPrefixMarker"], json!(false));
+        assert_eq!(signals["earlierMarkerOffsetFromEnd"], json!(2));
+        assert_eq!(signals["earlierMarkerRole"], json!("user"));
+        assert_eq!(signals["earlierPrefixMarker"], json!(true));
+        assert_eq!(signals["earlierTaskMarker"], json!(true));
+        assert_eq!(signals["earlierMarkersSameBlock"], json!(true));
+    }
+
+    #[test]
+    fn compact_signals_are_all_negative_for_ordinary_chat_and_carry_no_text() {
+        let signals = compact_signals(
+            json!([{"role": "user", "content": "please summarize the file"}]),
+            "You are Claude Code.",
+        );
+        assert_eq!(signals["detector"], json!(false));
+        assert_eq!(signals["systemMarker"], json!(false));
+        assert_eq!(signals["lastContentIsString"], json!(true));
+        assert_eq!(signals["lastPrefixMarker"], json!(false));
+        assert_eq!(signals["lastTaskMarker"], json!(false));
+        assert_eq!(signals["earlierMarkerOffsetFromEnd"], Value::Null);
+        for value in signals.values() {
+            assert!(
+                value.is_boolean() || value.is_number() || value.is_null() || value == "user",
+                "signal leaked non-metadata value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_signals_report_the_system_marker_branch() {
+        let signals = compact_signals(
+            json!([{"role": "user", "content": "anything"}]),
+            "You are a helpful AI assistant tasked with summarizing conversations.",
+        );
+        assert_eq!(signals["detector"], json!(true));
+        assert_eq!(signals["systemMarker"], json!(true));
+        assert_eq!(signals["lastMarkersSameBlock"], json!(false));
+    }
+
     #[test]
     fn compact_message_markers_must_be_in_final_user_message() {
         let req: MessagesRequest = serde_json::from_value(json!({
@@ -1903,6 +2151,70 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Low)));
+    }
+
+    #[test]
+    fn compact_request_without_effort_uses_cap() {
+        // Claude Code can send a compaction request with no output_config.
+        // The cap is the intended effort for compaction, so a missing effort
+        // must resolve to it rather than bypass the cap entirely.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"summarize"}],
+            "system": "You are a helpful AI assistant tasked with summarizing conversations."
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let reasoning = out.reasoning.expect("compact request carries reasoning");
+        assert!(matches!(reasoning.effort, Some(Effort::Low)));
+        assert_eq!(reasoning.summary.as_deref(), Some("auto"));
+        assert_eq!(
+            out.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
+    }
+
+    #[test]
+    fn compact_cap_fills_missing_effort_and_keeps_lower_effort() {
+        // Cap disabled (CCP_COMPACT_EFFORT=off): the request is untouched,
+        // including a missing effort.
+        assert!(apply_compact_effort_cap(None, None).is_none());
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), None),
+            Some(Effort::High)
+        ));
+        // Missing effort resolves to the cap.
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::None)),
+            Some(Effort::None)
+        ));
+        // An explicit effort below the cap is preserved.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::Low), Some(Effort::Medium)),
+            Some(Effort::Low)
+        ));
+        // An explicit effort above the cap is lowered to it.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+    }
+
+    #[test]
+    fn non_compact_request_without_effort_omits_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(out.reasoning.is_none());
+        assert!(out.include.is_none());
     }
 
     #[test]

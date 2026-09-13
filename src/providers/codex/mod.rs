@@ -56,8 +56,11 @@ use self::translate::model_allowlist::{
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    ResponsesRequest, TranslateOptions, compact_effort_cap, has_hosted_web_search,
+    is_compact_messages_request, translate_request,
 };
+
+pub(crate) use self::translate::request::compact_request_signals;
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
@@ -218,6 +221,9 @@ impl CodexProvider {
         };
 
         let compact_boundary = is_compact_messages_request(&body);
+        if compact_boundary {
+            log_compact_effort(&ctx, &body, &translated);
+        }
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
         if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
@@ -633,6 +639,37 @@ fn log_compaction_event(
     } else {
         create_logger("codex").info(event, Some(fields));
     }
+}
+
+/// Records how a compaction request's reasoning effort was resolved. Metadata
+/// only: no prompt text, tool output, or credentials.
+fn log_compact_effort(ctx: &RequestContext, body: &MessagesRequest, translated: &ResponsesRequest) {
+    let incoming = crate::providers::translate_shared::read_effort(body)
+        .ok()
+        .flatten();
+    let resolved = translated
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_ref())
+        .map(ToString::to_string);
+    let cap = compact_effort_cap().map(|cap| cap.to_string());
+    let mut fields = serde_json::Map::new();
+    fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
+    fields.insert("sessionId".into(), serde_json::json!(ctx.session_id));
+    fields.insert("model".into(), serde_json::json!(translated.model));
+    fields.insert("incomingEffort".into(), serde_json::json!(incoming));
+    fields.insert("resolvedEffort".into(), serde_json::json!(resolved));
+    fields.insert("compactEffortCap".into(), serde_json::json!(cap));
+    fields.insert(
+        "reasoningSummary".into(),
+        serde_json::json!(
+            translated
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.summary.as_deref())
+        ),
+    );
+    create_logger("codex").info("compact_effort_resolved", Some(fields));
 }
 
 fn abort_request_state(

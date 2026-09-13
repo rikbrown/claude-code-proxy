@@ -36,7 +36,7 @@ Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`,
 
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
-Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
+Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. A compaction request that names a lower effort keeps it. A compaction request that names no effort uses the cap, so compaction does not run at the upstream default effort. Each compaction request writes a `compact_effort_resolved` entry to the proxy log with the incoming effort, the resolved effort, and the cap.
 
 ## Tools and multimodal input
 
