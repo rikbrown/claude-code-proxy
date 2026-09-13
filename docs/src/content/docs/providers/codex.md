@@ -114,6 +114,8 @@ Codex can also compact a conversation on the server while it answers. With conte
 
 :::caution
 The Responses Lite lane rejects server-side compaction (`X-OpenAI-Internal-Codex-Responses-Lite does not support server-side compaction`). The proxy serves `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-6-astra` on that lane, so context management is unavailable on the default `gpt-5.6-*` and `gpt-6-*` routes. Requests for those models are sent without `context_management`, and no compaction item is captured or replayed for them. Only full-lane models such as `gpt-5.5` use the feature. A `context_management_unsupported_lane` log event is written once per process when the feature is enabled but the request runs on the Lite lane.
+
+`codex.fullLane` or `CCP_CODEX_FULL_LANE` moves those models onto the full Responses lane, where context management is available. It is off by default. On the full lane the proxy identifies itself as `claude-code-proxy` instead of `codex_cli_rs`, and `parallel_tool_calls` is no longer forced off, so the model may return several tool calls in one turn. Hosted `web_search` requests already use the full lane without this setting.
 :::
 
 The proxy keeps the last `compaction` item from a completed turn in memory for that conversation owner and model, together with two records: what a later request must match, and what the item may replace. The item's real coverage cannot be read from the stream. Live probes show it holds the request input and the output items emitted before it, but an item emitted at `output_index` 0 has also been observed to hold the message emitted after it. Its stream position is therefore a lower bound on coverage, not an upper bound.
@@ -131,7 +133,8 @@ Context management is disabled by default. Enable it in `config.json`:
 {
   "codex": {
     "contextManagement": true,
-    "contextManagementThreshold": 200000
+    "contextManagementThreshold": 200000,
+    "fullLane": true
   }
 }
 ```
