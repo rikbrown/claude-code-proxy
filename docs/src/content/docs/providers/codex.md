@@ -108,6 +108,39 @@ Replay requires the same Claude Code session and Codex model with append-only hi
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
+## Context management
+
+Codex can also compact a conversation on the server while it answers. With context management enabled, every Codex request carries `context_management` with a `compaction` entry and a token threshold. When the rendered window crosses that threshold, Codex compacts mid-stream and returns an opaque encrypted `compaction` item alongside the normal answer. Unlike server compaction, this needs no extra request and does not wait for a Claude Code compaction boundary.
+
+The proxy keeps the last `compaction` item from a completed turn in memory for that conversation owner and model. On the next turn, if the translated input is an append-only extension of the history the item covers, the proxy sends the item in place of that history and keeps the newer items in full. Claude Code still sends its complete history; only the upstream request is shortened. The item covers the input of the turn that produced it, so that turn's own reply is sent again rather than lost.
+
+### Enable context management
+
+Context management is disabled by default. Enable it in `config.json`:
+
+```json
+{
+  "codex": {
+    "contextManagement": true,
+    "contextManagementThreshold": 200000
+  }
+}
+```
+
+Or enable it for one proxy process:
+
+```sh
+CCP_CODEX_CONTEXT_MANAGEMENT=1 claude-code-proxy serve
+```
+
+`codex.contextManagementThreshold` or `CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD` sets the `compact_threshold` in tokens. The default is `200000`. Codex rejects values below `1000`, so the proxy ignores them and uses the default.
+
+### Fallbacks and visibility
+
+Replay requires the same conversation owner, Codex model, system prompt, tools, and request shape, with append-only history. A branch, edited history, provider or model change, proxy restart, memory limit, or 30 minutes without matching activity discards the stored item and sends the full history. The item is never combined with a server compaction replay in one request. State is held only in memory and is lost when the proxy restarts.
+
+Structured log events named `context_management_blob_captured`, `context_management_replayed`, and `context_management_discarded` report each capture, replay, and discard with counts and reasons only.
+
 ## OpenAI-compatible APIs
 
 `CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.

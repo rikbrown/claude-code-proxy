@@ -3233,6 +3233,7 @@ mod tests {
                 format: None,
             },
             reasoning: None,
+            context_management: None,
         }
     }
 
@@ -3907,7 +3908,7 @@ mod tests {
             .socket_id
             .expect("first socket must be reusable");
         super::super::update_continuation_from_upstream(
-            None,
+            &http_test_context(),
             &first_candidate,
             None,
             &first_request,
@@ -3938,7 +3939,7 @@ mod tests {
             .expect("full-context retry socket must be reusable");
         assert_ne!(second_socket_id, first_socket_id);
         super::super::update_continuation_from_upstream(
-            None,
+            &http_test_context(),
             &second_candidate,
             None,
             &second_request,
@@ -4040,7 +4041,7 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &http_test_context(),
             &first_candidate,
             None,
             &first_request,
@@ -4155,7 +4156,7 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &http_test_context(),
             &first_candidate,
             None,
             &first_request,
@@ -5291,6 +5292,7 @@ mod tests {
                 format: None,
             },
             reasoning: None,
+            context_management: None,
         };
         let payload = build_websocket_request(&req, None);
         assert_eq!(
