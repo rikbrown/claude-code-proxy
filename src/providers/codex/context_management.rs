@@ -5,14 +5,23 @@
 //! send that item in place of the history it represents. Unlike server
 //! compaction, no extra request is made: the blob arrives on an ordinary turn.
 //!
-//! Safety comes from the prefix check, not from turn bookkeeping. The stored
-//! state records a digest of every conversation item the blob covers, and a
-//! blob is only ever substituted for a request whose conversation starts with
-//! exactly those items under the same model and prompt shape. Anything else
-//! discards the state and sends the full history.
+//! Safety comes from an explicit coverage boundary, not from turn bookkeeping.
+//! A blob emitted after some of the turn's output items contains those items
+//! as well as the request input, so the stored state records a digest of every
+//! client-visible item the blob stands for: the request's conversation items
+//! followed by the output items emitted before the blob. A blob is only ever
+//! substituted for a request whose conversation starts with exactly that
+//! boundary under the same model and prompt shape. Anything else discards the
+//! state and sends the full history. A turn generation guard additionally
+//! stops a late-completing older turn from installing state over a newer one.
+//!
+//! The feature is unavailable on the Responses Lite lane, which rejects
+//! server-side compaction; requests translated for that lane never carry
+//! `context_management`, and capture and replay both key off that field.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -21,10 +30,12 @@ use crate::request_identity::ConversationIdentity;
 
 use super::compaction::split_input_envelope;
 use super::continuation::{canonical_input_item, prompt_signature, stable_json};
+use super::translate::reducer::CompactionOutput;
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const STATE_TTL_MS: u64 = 30 * 60 * 1_000;
 const MAX_STATES: usize = 1_000;
+const MAX_TURNS: usize = 10_000;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 const MAX_COVERED_ITEMS: usize = 100_000;
 const MAX_TOTAL_STATE_BYTES: usize = 20_000_000;
@@ -36,20 +47,36 @@ struct ContextState {
     prompt_signature: String,
     envelope: Vec<ItemDigest>,
     /// Digests of the client-visible conversation items the blob stands for,
-    /// in order. Chained replays keep extending this list so the client's
-    /// full history always matches even though the wire never carries it.
+    /// in order: the producing request's conversation items followed by the
+    /// output items emitted before the blob. Chained replays keep extending
+    /// this list so the client's full history always matches even though the
+    /// wire never carries it.
     covered: Vec<ItemDigest>,
     encrypted_content: String,
+    updated_at: u64,
+}
+
+struct TurnEntry {
+    id: u64,
     updated_at: u64,
 }
 
 #[derive(Default)]
 struct ContextRegistry {
     states: HashMap<ConversationIdentity, ContextState>,
+    /// The newest turn begun per owner. Only that turn may install state.
+    turns: HashMap<ConversationIdentity, TurnEntry>,
     total_bytes: usize,
 }
 
 static REGISTRY: Mutex<Option<ContextRegistry>> = Mutex::new(None);
+static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A generation token for one request under one owner. Capture requires the
+/// token to still be the owner's newest, so an older turn that completes after
+/// a newer one began cannot install state the newer history then matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextTurn(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscardReason {
@@ -95,9 +122,35 @@ pub enum CaptureOutcome {
         blob_bytes: usize,
         chained: bool,
     },
+    /// A replayed turn finished without a new blob; the old state stands.
     Retained,
+    /// Nothing to record: no owner, no turn, or no blob.
     Skipped,
+    /// A newer turn began for this owner before this one completed.
+    Superseded,
+    /// The blob's coverage could not be established, so nothing was stored.
+    /// Any existing state is left untouched.
+    Refused(&'static str),
     Discarded(DiscardReason),
+}
+
+/// Marks the start of a request for `owner`. The returned token must be
+/// passed to [`capture_context_blob`] when the turn completes.
+pub fn begin_context_turn(owner: Option<&ConversationIdentity>) -> Option<ContextTurn> {
+    let owner = owner?;
+    let id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.get_or_insert_with(ContextRegistry::default);
+    evict_states(registry, now);
+    registry.turns.insert(
+        owner.clone(),
+        TurnEntry {
+            id,
+            updated_at: now,
+        },
+    );
+    Some(ContextTurn(id))
 }
 
 /// Substitutes the stored blob for the covered prefix of `request.input` when
@@ -124,6 +177,9 @@ pub fn apply_context_replay(
         remove_state(registry, owner);
         return ReplayOutcome::Discarded(reason);
     }
+    // The conversation must begin with the whole boundary: the producing
+    // request's items and the output items the blob absorbed. A reply that
+    // differs from the one inside the blob fails here and is never replayed.
     let covered_items = state.covered.len();
     if conversation.len() < covered_items
         || conversation[..covered_items]
@@ -156,16 +212,25 @@ pub fn apply_context_replay(
     }))
 }
 
-/// Records the blob a completed turn produced, keyed by the conversation items
-/// the request carried. `request` is the input actually sent upstream; when it
-/// was itself a replay, the new blob covers the old blob's history plus the
-/// tail, so the stored digests are extended rather than replaced.
+/// Records the blob a completed turn produced. `request` is the input actually
+/// sent upstream and `output_items` the turn's captured output in order;
+/// `compaction` says how many leading output items the blob was emitted
+/// after. The stored boundary is the request's conversation items followed by
+/// those covered output items. When the request was itself a replay, the new
+/// blob covers the old blob's history plus the tail, so the stored digests are
+/// extended rather than replaced.
+///
+/// Coverage is only claimed for output item kinds whose client round-trip
+/// form is reproduced exactly by request translation (assistant messages,
+/// function calls, and reasoning items). Anything else refuses to store.
 pub fn capture_context_blob(
     owner: Option<&ConversationIdentity>,
+    turn: Option<ContextTurn>,
     request: &ResponsesRequest,
-    encrypted_content: Option<&str>,
+    output_items: &[ResponsesInputItem],
+    compaction: Option<&CompactionOutput>,
 ) -> CaptureOutcome {
-    let Some(owner) = owner else {
+    let (Some(owner), Some(turn)) = (owner, turn) else {
         return CaptureOutcome::Skipped;
     };
     let (envelope, conversation) = split_input_envelope(&request.input);
@@ -186,6 +251,9 @@ pub fn capture_context_blob(
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(ContextRegistry::default);
     evict_states(registry, now);
+    if registry.turns.get(owner).map(|entry| entry.id) != Some(turn.0) {
+        return CaptureOutcome::Superseded;
+    }
 
     let envelope_digests: Vec<ItemDigest> = envelope.iter().map(item_digest).collect();
     let mut covered = Vec::new();
@@ -199,18 +267,25 @@ pub fn capture_context_blob(
             remove_state(registry, owner);
             return CaptureOutcome::Discarded(DiscardReason::ReplayMismatch);
         }
-        if encrypted_content.is_none() {
+        if compaction.is_none() {
             state.updated_at = now;
             return CaptureOutcome::Retained;
         }
         covered.extend_from_slice(&state.covered);
     }
-    let Some(encrypted_content) = encrypted_content else {
+    let Some(compaction) = compaction else {
         return CaptureOutcome::Skipped;
     };
+    let Some(covered_output) = output_items.get(..compaction.covered_output_items) else {
+        return CaptureOutcome::Refused("covered_output_beyond_items");
+    };
+    if !covered_output.iter().all(round_trips_exactly) {
+        return CaptureOutcome::Refused("unsupported_output_item");
+    }
     covered.extend(tail.iter().map(item_digest));
+    covered.extend(covered_output.iter().map(item_digest));
 
-    if encrypted_content.len() > MAX_BLOB_BYTES || covered.len() > MAX_COVERED_ITEMS {
+    if compaction.encrypted_content.len() > MAX_BLOB_BYTES || covered.len() > MAX_COVERED_ITEMS {
         remove_state(registry, owner);
         return CaptureOutcome::Discarded(DiscardReason::TooLarge);
     }
@@ -219,12 +294,12 @@ pub fn capture_context_blob(
         prompt_signature: prompt_signature(request),
         envelope: envelope_digests,
         covered,
-        encrypted_content: encrypted_content.to_string(),
+        encrypted_content: compaction.encrypted_content.clone(),
         updated_at: now,
     };
     let outcome = CaptureOutcome::Captured {
         covered_items: state.covered.len(),
-        blob_bytes: encrypted_content.len(),
+        blob_bytes: compaction.encrypted_content.len(),
         chained: replayed_blob.is_some(),
     };
     registry.states.insert(owner.clone(), state);
@@ -236,15 +311,33 @@ pub fn capture_context_blob(
     }
 }
 
+/// Whether request translation reproduces this reducer output item exactly
+/// when Claude Code echoes it back on the next turn, so its digest can be
+/// part of the coverage boundary.
+fn round_trips_exactly(item: &ResponsesInputItem) -> bool {
+    match item {
+        ResponsesInputItem::Message { role, .. } => role == "assistant",
+        ResponsesInputItem::FunctionCall { .. } | ResponsesInputItem::Reasoning { .. } => true,
+        ResponsesInputItem::AdditionalTools { .. }
+        | ResponsesInputItem::FunctionCallOutput { .. }
+        | ResponsesInputItem::Compaction { .. }
+        | ResponsesInputItem::CompactionTrigger => false,
+    }
+}
+
 /// Drops every owner belonging to a Claude Code session, including its agents.
 pub fn clear_session_context(session_id: &str) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut() {
-        registry.states.retain(|owner, _| match owner {
+        let belongs_to_session = |owner: &ConversationIdentity| match owner {
             ConversationIdentity::Main(session) | ConversationIdentity::Agent(session, _) => {
-                session != session_id
+                session == session_id
             }
-        });
+        };
+        registry
+            .states
+            .retain(|owner, _| !belongs_to_session(owner));
+        registry.turns.retain(|owner, _| !belongs_to_session(owner));
         update_total_bytes(registry);
     }
 }
@@ -322,6 +415,20 @@ fn evict_states(registry: &mut ContextRegistry, now: u64) {
     registry
         .states
         .retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
+    registry
+        .turns
+        .retain(|_, turn| now.saturating_sub(turn.updated_at) <= STATE_TTL_MS);
+    while registry.turns.len() > MAX_TURNS {
+        let oldest = registry
+            .turns
+            .iter()
+            .min_by_key(|(_, turn)| turn.updated_at)
+            .map(|(owner, _)| owner.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        registry.turns.remove(&oldest);
+    }
     update_total_bytes(registry);
     while registry.states.len() > MAX_STATES || registry.total_bytes > MAX_TOTAL_STATE_BYTES {
         let oldest = registry
@@ -374,8 +481,52 @@ mod tests {
         json!({"type":"compaction","encrypted_content":blob})
     }
 
-    fn captured(input: serde_json::Value, blob: &str) -> CaptureOutcome {
-        capture_context_blob(Some(&owner()), &request(input), Some(blob))
+    fn items(values: &[serde_json::Value]) -> Vec<ResponsesInputItem> {
+        values
+            .iter()
+            .map(|value| serde_json::from_value(value.clone()).unwrap())
+            .collect()
+    }
+
+    fn blob(encrypted_content: &str, covered_output_items: usize) -> CompactionOutput {
+        CompactionOutput {
+            encrypted_content: encrypted_content.to_string(),
+            covered_output_items,
+        }
+    }
+
+    fn turn() -> Option<ContextTurn> {
+        begin_context_turn(Some(&owner()))
+    }
+
+    /// Captures a blob emitted before any output item, so the boundary is the
+    /// request input alone.
+    fn captured(input: serde_json::Value, encrypted_content: &str) -> CaptureOutcome {
+        let turn = turn();
+        capture_context_blob(
+            Some(&owner()),
+            turn,
+            &request(input),
+            &[],
+            Some(&blob(encrypted_content, 0)),
+        )
+    }
+
+    /// Captures a blob emitted after `covered` of the given output items.
+    fn captured_with_output(
+        input: serde_json::Value,
+        output: &[serde_json::Value],
+        covered: usize,
+        encrypted_content: &str,
+    ) -> CaptureOutcome {
+        let turn = turn();
+        capture_context_blob(
+            Some(&owner()),
+            turn,
+            &request(input),
+            &items(output),
+            Some(&blob(encrypted_content, covered)),
+        )
     }
 
     fn replay_input(outcome: ReplayOutcome) -> Vec<serde_json::Value> {
@@ -453,10 +604,17 @@ mod tests {
             panic!("expected a replay");
         };
 
+        let turn = turn();
         assert_eq!(
-            capture_context_blob(Some(&owner()), &replay.request, Some("blob-2")),
+            capture_context_blob(
+                Some(&owner()),
+                turn,
+                &replay.request,
+                &items(&[assistant("four")]),
+                Some(&blob("blob-2", 1)),
+            ),
             CaptureOutcome::Captured {
-                covered_items: 3,
+                covered_items: 4,
                 blob_bytes: 6,
                 chained: true
             }
@@ -469,10 +627,125 @@ mod tests {
             user("five")
         ]));
         let input = replay_input(apply_context_replay(Some(&owner()), &later));
+        assert_eq!(input, vec![compaction("blob-2"), user("five")]);
+    }
+
+    #[test]
+    fn blob_after_output_covers_that_output() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        assert_eq!(
+            captured_with_output(json!([user("one")]), &[assistant("two")], 1, "blob-1"),
+            CaptureOutcome::Captured {
+                covered_items: 2,
+                blob_bytes: 6,
+                chained: false
+            }
+        );
+        let next = request(json!([user("one"), assistant("two"), user("three")]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &next));
+        assert_eq!(input, vec![compaction("blob-1"), user("three")]);
+    }
+
+    #[test]
+    fn differing_reply_never_replays_a_blob_that_holds_another_reply() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        captured_with_output(json!([user("one")]), &[assistant("two")], 1, "blob-1");
+        // The client kept a different reply (edit, regeneration, or a
+        // competing turn); the blob holds "two", so it must not be sent.
+        let next = request(json!([user("one"), assistant("other"), user("three")]));
+        assert!(matches!(
+            apply_context_replay(Some(&owner()), &next),
+            ReplayOutcome::Discarded(DiscardReason::NotAppendOnly)
+        ));
+        assert!(matches!(
+            apply_context_replay(Some(&owner()), &next),
+            ReplayOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn blob_before_output_leaves_output_explicit() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        let call = json!({"type":"function_call","call_id":"call-1","name":"Read","arguments":"{\"path\":\"a\"}"});
+        assert_eq!(
+            captured_with_output(
+                json!([user("one")]),
+                &[call.clone(), assistant("two")],
+                1,
+                "blob-1"
+            ),
+            CaptureOutcome::Captured {
+                covered_items: 2,
+                blob_bytes: 6,
+                chained: false
+            }
+        );
+        let next = request(json!([user("one"), call, assistant("two"), user("three")]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &next));
         assert_eq!(
             input,
-            vec![compaction("blob-2"), assistant("four"), user("five")]
+            vec![compaction("blob-1"), assistant("two"), user("three")]
         );
+    }
+
+    #[test]
+    fn late_older_turn_cannot_install_state_over_a_newer_turn() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        let history = request(json!([user("one")]));
+        let older = turn();
+        let newer = turn();
+        assert_eq!(
+            capture_context_blob(
+                Some(&owner()),
+                newer,
+                &history,
+                &items(&[assistant("new")]),
+                Some(&blob("blob-new", 1)),
+            ),
+            CaptureOutcome::Captured {
+                covered_items: 2,
+                blob_bytes: 8,
+                chained: false
+            }
+        );
+        assert_eq!(
+            capture_context_blob(
+                Some(&owner()),
+                older,
+                &history,
+                &items(&[assistant("old")]),
+                Some(&blob("blob-old", 1)),
+            ),
+            CaptureOutcome::Superseded
+        );
+
+        let next = request(json!([user("one"), assistant("new"), user("two")]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &next));
+        assert_eq!(input, vec![compaction("blob-new"), user("two")]);
+    }
+
+    #[test]
+    fn unpositionable_or_unsupported_coverage_stores_nothing() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        let output = json!({"type":"function_call_output","call_id":"call-1","output":"ok"});
+        assert_eq!(
+            captured_with_output(json!([user("one")]), &[output], 1, "blob-1"),
+            CaptureOutcome::Refused("unsupported_output_item")
+        );
+        assert_eq!(
+            captured_with_output(json!([user("one")]), &[assistant("two")], 2, "blob-1"),
+            CaptureOutcome::Refused("covered_output_beyond_items")
+        );
+        let next = request(json!([user("one"), assistant("two"), user("three")]));
+        assert!(matches!(
+            apply_context_replay(Some(&owner()), &next),
+            ReplayOutcome::Unchanged
+        ));
     }
 
     #[test]
@@ -484,8 +757,9 @@ mod tests {
         let ReplayOutcome::Replayed(replay) = apply_context_replay(Some(&owner()), &next) else {
             panic!("expected a replay");
         };
+        let turn = turn();
         assert_eq!(
-            capture_context_blob(Some(&owner()), &replay.request, None),
+            capture_context_blob(Some(&owner()), turn, &replay.request, &[], None),
             CaptureOutcome::Retained
         );
 
@@ -520,11 +794,16 @@ mod tests {
         clear_all_context_management_for_tests();
         let body = request(json!([user("one")]));
         assert_eq!(
-            capture_context_blob(None, &body, Some("blob")),
+            capture_context_blob(None, None, &body, &[], Some(&blob("blob", 0))),
             CaptureOutcome::Skipped
         );
         assert_eq!(
-            capture_context_blob(Some(&owner()), &body, None),
+            capture_context_blob(Some(&owner()), None, &body, &[], Some(&blob("blob", 0))),
+            CaptureOutcome::Skipped
+        );
+        let turn = turn();
+        assert_eq!(
+            capture_context_blob(Some(&owner()), turn, &body, &[], None),
             CaptureOutcome::Skipped
         );
         assert!(matches!(
@@ -625,12 +904,25 @@ mod tests {
             compaction("other-feature"),
             user("two")
         ]));
+        let turn = turn();
         assert_eq!(
-            capture_context_blob(Some(&owner()), &trailing, Some("blob-2")),
+            capture_context_blob(
+                Some(&owner()),
+                turn,
+                &trailing,
+                &[],
+                Some(&blob("blob-2", 0))
+            ),
             CaptureOutcome::Skipped
         );
         assert!(matches!(
-            capture_context_blob(Some(&owner()), &server_compaction, Some("blob-2")),
+            capture_context_blob(
+                Some(&owner()),
+                turn,
+                &server_compaction,
+                &[],
+                Some(&blob("blob-2", 0))
+            ),
             CaptureOutcome::Discarded(DiscardReason::ReplayMismatch)
         ));
     }
@@ -640,6 +932,7 @@ mod tests {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_context_management_for_tests();
         captured(json!([user("one")]), "blob-old");
+        let older_turn = turn();
         let older = request(json!([user("one"), user("two")]));
         let ReplayOutcome::Replayed(older_replay) = apply_context_replay(Some(&owner()), &older)
         else {
@@ -647,11 +940,40 @@ mod tests {
         };
         captured(json!([user("one"), user("two")]), "blob-new");
 
+        // The newer turn's state stands; the stale completion is ignored.
+        assert_eq!(
+            capture_context_blob(
+                Some(&owner()),
+                older_turn,
+                &older_replay.request,
+                &[],
+                Some(&blob("blob-late", 0))
+            ),
+            CaptureOutcome::Superseded
+        );
+        let next = request(json!([user("one"), user("two"), user("three")]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &next));
+        assert_eq!(input, vec![compaction("blob-new"), user("three")]);
+    }
+
+    #[test]
+    fn replayed_blob_mismatch_discards_state() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        captured(json!([user("one")]), "blob-1");
+        let turn = turn();
+        let foreign = request(json!([compaction("blob-other"), user("two")]));
         assert!(matches!(
-            capture_context_blob(Some(&owner()), &older_replay.request, Some("blob-late")),
+            capture_context_blob(
+                Some(&owner()),
+                turn,
+                &foreign,
+                &[],
+                Some(&blob("blob-2", 0))
+            ),
             CaptureOutcome::Discarded(DiscardReason::ReplayMismatch)
         ));
-        let next = request(json!([user("one"), user("two"), user("three")]));
+        let next = request(json!([user("one"), user("two")]));
         assert!(matches!(
             apply_context_replay(Some(&owner()), &next),
             ReplayOutcome::Unchanged
@@ -696,7 +1018,8 @@ mod tests {
         let other = ConversationIdentity::Main("other".to_string());
         let body = request(json!([user("one")]));
         for owner in [&owner(), &agent, &other] {
-            capture_context_blob(Some(owner), &body, Some("blob"));
+            let turn = begin_context_turn(Some(owner));
+            capture_context_blob(Some(owner), turn, &body, &[], Some(&blob("blob", 0)));
         }
 
         clear_session_context("session");
