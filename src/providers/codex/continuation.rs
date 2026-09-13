@@ -544,46 +544,33 @@ fn input_suffix_after_prefix(
     Some(input[prefix.len()..].to_vec())
 }
 
-/// Compares two transcript items for continuation prefix purposes.
+/// Compares two transcript items for append-only prefix purposes.
+fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> bool {
+    canonical_input_item(a) == canonical_input_item(b)
+}
+
+/// The form in which transcript items are compared across turns.
 ///
 /// `function_call.arguments` is a JSON string that is asymmetric across the two
 /// sides: the recorded transcript keeps the raw text the model streamed, while
 /// the next request re-serializes the client's parsed tool input (sorted keys,
-/// no whitespace). Compare those two as JSON values so a purely textual
-/// difference does not break an otherwise append-only prefix.
-fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> bool {
-    match (a, b) {
-        (
-            ResponsesInputItem::FunctionCall {
-                call_id: a_call_id,
-                name: a_name,
-                arguments: a_arguments,
-            },
-            ResponsesInputItem::FunctionCall {
-                call_id: b_call_id,
-                name: b_name,
-                arguments: b_arguments,
-            },
-        ) => {
-            a_call_id == b_call_id
-                && a_name == b_name
-                && (a_arguments == b_arguments
-                    || matches!(
-                        (
-                            serde_json::from_str::<serde_json::Value>(a_arguments),
-                            serde_json::from_str::<serde_json::Value>(b_arguments),
-                        ),
-                        (Ok(a_value), Ok(b_value)) if a_value == b_value
-                    ))
-        }
-        _ => {
-            serde_json::to_value(a).unwrap_or_default()
-                == serde_json::to_value(b).unwrap_or_default()
-        }
+/// no whitespace). Normalise parseable arguments to their stable JSON text so a
+/// purely textual difference does not break an otherwise append-only prefix.
+pub(crate) fn canonical_input_item(item: &ResponsesInputItem) -> serde_json::Value {
+    let mut value = serde_json::to_value(item).unwrap_or_default();
+    if let ResponsesInputItem::FunctionCall { arguments, .. } = item
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(arguments)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "arguments".to_string(),
+            serde_json::Value::String(stable_json(&parsed)),
+        );
     }
+    value
 }
 
-fn prompt_signature(body: &ResponsesRequest) -> String {
+pub(crate) fn prompt_signature(body: &ResponsesRequest) -> String {
     let value = serde_json::to_value(body).unwrap_or_default();
     let obj = match value.as_object() {
         Some(o) => o,
@@ -603,7 +590,7 @@ fn prompt_signature(body: &ResponsesRequest) -> String {
     sig
 }
 
-fn stable_json(value: &serde_json::Value) -> String {
+pub(crate) fn stable_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => b.to_string(),

@@ -125,6 +125,7 @@ pub enum ReducerEvent {
         web_search_requests: usize,
         response_id: Option<String>,
         output_items: Vec<ResponsesInputItem>,
+        compaction_encrypted_content: Option<String>,
     },
 }
 
@@ -133,6 +134,10 @@ pub struct FinishMetadata {
     pub continuation_eligible: bool,
     pub response_id: Option<String>,
     pub output_items: Vec<ResponsesInputItem>,
+    /// The last server-side `compaction` output item of the turn. Kept apart
+    /// from `output_items` because the client never echoes it back, so it
+    /// must not enter the append-only continuation transcript.
+    pub compaction_encrypted_content: Option<String>,
 }
 
 enum BlockState {
@@ -238,11 +243,13 @@ pub fn finish_metadata_from_upstream(
             continuation_eligible,
             response_id,
             output_items,
+            compaction_encrypted_content,
             ..
         } => Some(FinishMetadata {
             continuation_eligible,
             response_id,
             output_items,
+            compaction_encrypted_content,
         }),
         _ => None,
     }))
@@ -275,6 +282,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
     let mut incomplete = false;
+    let mut compaction_encrypted_content: Option<String> = None;
     let mut web_search_requests = 0usize;
     let mut _saw_terminal = false;
     let mut event_count = 0usize;
@@ -658,6 +666,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                     web_search_requests,
                     response_id: None,
                     output_items,
+                    compaction_encrypted_content,
                 });
                 return Ok(out);
             }
@@ -683,6 +692,19 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
             let output_index: usize =
                 p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let item = p.get("item");
+
+            if let Some(item_val) = item
+                && item_val.get("type").and_then(|v| v.as_str()) == Some("compaction")
+            {
+                // Several compaction items can arrive in one turn; the last
+                // one covers the most history.
+                if let Some(encrypted_content) =
+                    item_val.get("encrypted_content").and_then(|v| v.as_str())
+                {
+                    compaction_encrypted_content = Some(encrypted_content.to_string());
+                }
+                continue;
+            }
 
             if let Some(item_val) = item
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
@@ -856,6 +878,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
         web_search_requests,
         response_id,
         output_items,
+        compaction_encrypted_content,
     });
 
     Ok(out)

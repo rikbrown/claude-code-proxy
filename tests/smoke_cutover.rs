@@ -5,6 +5,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
+use claude_code_proxy::providers::codex::context_management::clear_all_context_management_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_proxy::{
@@ -1751,6 +1752,130 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     assert_eq!(compaction["encrypted_content"], "opaque-history");
     assert!(replay.iter().any(|item| item["role"] == "user"));
     clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_context_management_replays_compaction_blob() {
+    let _guard = env_lock();
+    clear_all_context_management_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let request_number = {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            // Only the first turn crosses the threshold: two compaction items
+            // bracket the answer, and the last one must win.
+            let (leading_compaction, trailing_compaction) = if request_number == 1 {
+                (
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-1\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-2\"}}\n\n",
+                )
+            } else {
+                ("", "")
+            };
+            format!(
+                "{leading_compaction}\
+                 data: {{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
+                 data: {{\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"reply {request_number}\"}}\n\n\
+                 data: {{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                 {trailing_compaction}\
+                 data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{request_number}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+            )
+            .into_bytes()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _context_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "1");
+    let _threshold_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD", "5000");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "instructions",
+        "messages": [{"role":"user","content":"old conversation"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "instructions",
+        "messages": [
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":"reply 1"},
+            {"role":"user","content":"continue"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "reply 2");
+
+    let branched = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "instructions",
+        "messages": [
+            {"role":"user","content":"different conversation"},
+            {"role":"user","content":"continue"}
+        ]
+    }))
+    .await;
+    assert_eq!(branched.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert_eq!(
+            request["context_management"],
+            json!([{"type":"compaction","compact_threshold":5000}])
+        );
+    }
+    let has_compaction_item = |request: &Value| {
+        request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "compaction")
+    };
+    assert!(!has_compaction_item(&requests[0]));
+
+    let replay = requests[1]["input"].as_array().unwrap();
+    let compaction = replay
+        .iter()
+        .find(|item| item["type"] == "compaction")
+        .unwrap();
+    assert_eq!(compaction["encrypted_content"], "blob-2");
+    assert!(!requests[1].to_string().contains("blob-1"));
+    assert!(!requests[1].to_string().contains("old conversation"));
+    assert!(requests[1].to_string().contains("instructions"));
+    assert!(requests[1].to_string().contains("reply 1"));
+    assert!(requests[1].to_string().contains("continue"));
+    assert_eq!(replay[0]["role"], "developer");
+    assert_eq!(replay[1]["type"], "compaction");
+
+    assert!(!has_compaction_item(&requests[2]));
+    assert!(requests[2].to_string().contains("different conversation"));
+    clear_all_context_management_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]

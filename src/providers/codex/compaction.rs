@@ -73,6 +73,9 @@ pub async fn request_compaction(
     let conversation = without_compaction_instruction(conversation);
     let mut compaction_request = request.clone();
     compaction_request.instructions = None;
+    // Mid-stream context management is a separate opt-in; a compaction
+    // request must not also ask the server to compact on its own threshold.
+    compaction_request.context_management = None;
     compaction_request.input = envelope
         .iter()
         .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
@@ -265,7 +268,7 @@ pub fn clear_compaction(session_id: &str) {
     }
 }
 
-fn split_input_envelope(
+pub(crate) fn split_input_envelope(
     input: &[ResponsesInputItem],
 ) -> (&[ResponsesInputItem], &[ResponsesInputItem]) {
     let prefix_len = input
