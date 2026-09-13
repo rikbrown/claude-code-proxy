@@ -56,8 +56,8 @@ use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    uses_responses_lite,
+    assert_allowed_model, full_lane_web_search_model, request_uses_responses_lite,
+    resolve_model_request_with_config_override,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -675,7 +675,7 @@ fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> b
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    request_uses_responses_lite(model)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
