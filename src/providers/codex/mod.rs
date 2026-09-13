@@ -45,7 +45,8 @@ use self::compaction::{
     apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
 };
 use self::context_management::{
-    CaptureOutcome, ReplayOutcome, apply_context_replay, capture_context_blob,
+    CaptureOutcome, ContextTurn, ReplayOutcome, apply_context_replay, begin_context_turn,
+    capture_context_blob,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -301,7 +302,17 @@ impl CodexProvider {
         if !context_management_enabled && let Some(session_id) = ctx.session_id.as_deref() {
             context_management::clear_session_context(session_id);
         }
-        if context_management_enabled {
+        // Translation leaves `context_management` off the request on the
+        // Responses Lite lane, which rejects server-side compaction. Neither
+        // replay nor capture may run for such a request.
+        let context_management_active =
+            context_management_enabled && translated.context_management.is_some();
+        if context_management_enabled && !context_management_active {
+            log_context_management_unsupported_lane_once(&ctx, &translated.model);
+        }
+        let mut context_turn: Option<ContextTurn> = None;
+        if context_management_active {
+            context_turn = begin_context_turn(conversation_identity.as_ref());
             match apply_context_replay(conversation_identity.as_ref(), &translated) {
                 ReplayOutcome::Replayed(replay) => {
                     log_context_management_event(
@@ -383,6 +394,7 @@ impl CodexProvider {
                 LiveStreamCompaction {
                     compact_boundary,
                     attempt: compaction_attempt,
+                    context_turn,
                 },
                 configured_transport,
             )
@@ -512,6 +524,7 @@ impl CodexProvider {
                 &ctx,
                 &request_continuation,
                 compaction_attempt,
+                context_turn,
                 &translated,
                 &upstream.body,
                 upstream.socket_id,
@@ -544,6 +557,7 @@ impl CodexProvider {
                         &ctx,
                         &request_continuation,
                         compaction_attempt,
+                        context_turn,
                         &translated,
                         &upstream.body,
                         upstream.socket_id,
@@ -703,13 +717,43 @@ fn log_context_management_event<const N: usize>(
     create_logger("codex").info(event, Some(fields));
 }
 
+static UNSUPPORTED_LANE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Logs once per process that context management is configured but the
+/// request runs on the Responses Lite lane, where the feature is unavailable.
+fn log_context_management_unsupported_lane_once(ctx: &RequestContext, model: &str) {
+    if UNSUPPORTED_LANE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log_context_management_event(
+        "context_management_unsupported_lane",
+        ctx,
+        model,
+        [
+            ("responsesLite", serde_json::json!(true)),
+            (
+                "reason",
+                serde_json::json!("responses lite rejects server-side compaction"),
+            ),
+        ],
+    );
+}
+
 fn capture_context_management_blob(
     ctx: &RequestContext,
     owner: Option<&ConversationIdentity>,
+    turn: Option<ContextTurn>,
     request_body: &translate::request::ResponsesRequest,
-    encrypted_content: Option<&str>,
+    finish: &translate::reducer::FinishMetadata,
 ) {
-    match capture_context_blob(owner, request_body, encrypted_content) {
+    match capture_context_blob(
+        owner,
+        turn,
+        request_body,
+        &finish.output_items,
+        finish.compaction.as_ref(),
+    ) {
         CaptureOutcome::Captured {
             covered_items,
             blob_bytes,
@@ -729,6 +773,18 @@ fn capture_context_management_blob(
             ctx,
             &request_body.model,
             [("reason", serde_json::json!(reason.as_str()))],
+        ),
+        CaptureOutcome::Refused(reason) => log_context_management_event(
+            "context_management_capture_refused",
+            ctx,
+            &request_body.model,
+            [("reason", serde_json::json!(reason))],
+        ),
+        CaptureOutcome::Superseded => log_context_management_event(
+            "context_management_capture_superseded",
+            ctx,
+            &request_body.model,
+            [],
         ),
         CaptureOutcome::Retained | CaptureOutcome::Skipped => {}
     }
@@ -831,10 +887,12 @@ enum LiveStreamStart {
     },
 }
 
+/// Per-turn state a streamed response must settle when it ends.
 #[derive(Clone, Copy)]
 struct LiveStreamCompaction {
     compact_boundary: bool,
     attempt: Option<CompactionAttempt>,
+    context_turn: Option<ContextTurn>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1077,6 +1135,7 @@ async fn live_stream_response_once(
                     &ctx,
                     &request_continuation,
                     compaction.attempt,
+                    compaction.context_turn,
                     &request_body,
                     &upstream_sse_body,
                     upstream_events.socket_id(),
@@ -1100,6 +1159,7 @@ async fn live_stream_response_once(
                 &ctx,
                 &request_continuation,
                 compaction.attempt,
+                compaction.context_turn,
                 &request_body,
                 &upstream_sse_body,
                 upstream_events.socket_id(),
@@ -1302,6 +1362,7 @@ fn remaining_live_stream_response(
                             &ctx,
                             &request_continuation,
                             compaction.attempt,
+                            compaction.context_turn,
                             &request_body,
                             &upstream_sse_body,
                             upstream_events.socket_id(),
@@ -1530,6 +1591,7 @@ fn update_continuation_from_upstream(
     ctx: &RequestContext,
     continuation: &ContinuationReservation,
     compaction_attempt: Option<CompactionAttempt>,
+    context_turn: Option<ContextTurn>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
     socket_id: Option<u64>,
@@ -1553,12 +1615,15 @@ fn update_continuation_from_upstream(
                 socket_id,
                 &finish.output_items,
             );
-            if config::codex_context_management() {
+            // Only a request that carried `context_management` (full lane,
+            // feature on at request time) may install replay state.
+            if request_body.context_management.is_some() {
                 capture_context_management_blob(
                     ctx,
                     continuation.owner(),
+                    context_turn,
                     request_body,
-                    finish.compaction_encrypted_content.as_deref(),
+                    &finish,
                 );
             }
         }
@@ -2138,6 +2203,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                context_turn: None,
             },
         )
         .await
@@ -2407,6 +2473,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
             ),
@@ -2522,6 +2589,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
             )
@@ -2607,6 +2675,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
             ),
@@ -2793,6 +2862,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
             )
