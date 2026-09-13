@@ -5,15 +5,27 @@
 //! send that item in place of the history it represents. Unlike server
 //! compaction, no extra request is made: the blob arrives on an ordinary turn.
 //!
-//! Safety comes from an explicit coverage boundary, not from turn bookkeeping.
-//! A blob emitted after some of the turn's output items contains those items
-//! as well as the request input, so the stored state records a digest of every
-//! client-visible item the blob stands for: the request's conversation items
-//! followed by the output items emitted before the blob. A blob is only ever
-//! substituted for a request whose conversation starts with exactly that
-//! boundary under the same model and prompt shape. Anything else discards the
-//! state and sends the full history. A turn generation guard additionally
-//! stops a late-completing older turn from installing state over a newer one.
+//! Safety comes from an explicit boundary, not from turn bookkeeping, and the
+//! boundary has two parts because a blob's real coverage cannot be read off
+//! the stream. Live probes show a blob contains the request input plus the
+//! output items emitted before it, but a blob emitted at output_index 0 has
+//! also been observed to contain the message emitted after it. Position is
+//! therefore a lower bound on coverage, not an upper bound.
+//!
+//! - The *checked* prefix is the request's conversation items followed by
+//!   every output item of the producing turn that the client echoes back. A
+//!   blob is only ever replayed for a request whose conversation starts with
+//!   exactly that prefix under the same model and prompt shape, so a reply
+//!   that differs from the one inside the blob always fails the check.
+//! - The *stripped* count is the part of that prefix the blob is known to
+//!   hold: the request input plus the output items positionally before the
+//!   blob. Only that much is replaced on the wire; the rest of the checked
+//!   prefix stays explicit. A reply the blob happens to hold may therefore be
+//!   sent twice, which is wasteful but never wrong.
+//!
+//! Anything else discards the state and sends the full history. A turn
+//! generation guard additionally stops a late-completing older turn from
+//! installing state over a newer one.
 //!
 //! The feature is unavailable on the Responses Lite lane, which rejects
 //! server-side compaction; requests translated for that lane never carry
@@ -46,12 +58,16 @@ struct ContextState {
     model: String,
     prompt_signature: String,
     envelope: Vec<ItemDigest>,
-    /// Digests of the client-visible conversation items the blob stands for,
-    /// in order: the producing request's conversation items followed by the
-    /// output items emitted before the blob. Chained replays keep extending
+    /// Digests of the client-visible items a replaying request must begin
+    /// with, in order: the producing request's conversation items followed by
+    /// every echoable output item of that turn. Chained replays keep extending
     /// this list so the client's full history always matches even though the
     /// wire never carries it.
-    covered: Vec<ItemDigest>,
+    checked: Vec<ItemDigest>,
+    /// How many leading `checked` items the blob replaces on the wire: the
+    /// request input plus the output items emitted before the blob. Never
+    /// more than what position proves the blob holds.
+    stripped: usize,
     encrypted_content: String,
     updated_at: u64,
 }
@@ -118,7 +134,10 @@ pub enum ReplayOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureOutcome {
     Captured {
-        covered_items: usize,
+        /// Items a replaying request must begin with.
+        checked_items: usize,
+        /// Leading checked items the blob replaces on the wire.
+        stripped_items: usize,
         blob_bytes: usize,
         chained: bool,
     },
@@ -177,23 +196,19 @@ pub fn apply_context_replay(
         remove_state(registry, owner);
         return ReplayOutcome::Discarded(reason);
     }
-    // The conversation must begin with the whole boundary: the producing
-    // request's items and the output items the blob absorbed. A reply that
-    // differs from the one inside the blob fails here and is never replayed.
-    let covered_items = state.covered.len();
-    if conversation.len() < covered_items
-        || conversation[..covered_items]
-            .iter()
-            .zip(&state.covered)
-            .any(|(item, digest)| item_digest(item) != *digest)
-    {
+    // The conversation must begin with the whole checked prefix: the
+    // producing request's items and every echoable output item of that turn.
+    // A reply that differs from the one inside the blob fails here and is
+    // never replayed. Only the stripped part is then replaced on the wire.
+    if !starts_with_digests(conversation, &state.checked) {
         remove_state(registry, owner);
         return ReplayOutcome::Discarded(DiscardReason::NotAppendOnly);
     }
-    let tail = &conversation[covered_items..];
-    if tail.is_empty() {
+    if conversation.len() == state.checked.len() {
         return ReplayOutcome::Unchanged;
     }
+    let covered_items = state.stripped;
+    let tail = &conversation[covered_items..];
 
     let mut replay = request.clone();
     replay.input = envelope
@@ -215,14 +230,15 @@ pub fn apply_context_replay(
 /// Records the blob a completed turn produced. `request` is the input actually
 /// sent upstream and `output_items` the turn's captured output in order;
 /// `compaction` says how many leading output items the blob was emitted
-/// after. The stored boundary is the request's conversation items followed by
-/// those covered output items. When the request was itself a replay, the new
-/// blob covers the old blob's history plus the tail, so the stored digests are
-/// extended rather than replaced.
+/// after. The checked prefix becomes the request's conversation items
+/// followed by all of `output_items`; the stripped count covers the
+/// conversation items plus only the positionally covered output. When the
+/// request was itself a replay, the new blob covers the old blob's history
+/// plus the tail, so the stored digests are extended rather than replaced.
 ///
-/// Coverage is only claimed for output item kinds whose client round-trip
-/// form is reproduced exactly by request translation (assistant messages,
-/// function calls, and reasoning items). Anything else refuses to store.
+/// Every output item must be of a kind whose client round-trip form is
+/// reproduced exactly by request translation (assistant messages, function
+/// calls, and reasoning items); otherwise nothing is stored.
 pub fn capture_context_blob(
     owner: Option<&ConversationIdentity>,
     turn: Option<ContextTurn>,
@@ -256,13 +272,18 @@ pub fn capture_context_blob(
     }
 
     let envelope_digests: Vec<ItemDigest> = envelope.iter().map(item_digest).collect();
-    let mut covered = Vec::new();
+    let mut checked = Vec::new();
+    let mut stripped = 0;
     if let Some(replayed_blob) = replayed_blob {
         let Some(state) = registry.states.get_mut(owner) else {
             return CaptureOutcome::Discarded(DiscardReason::ReplayMismatch);
         };
+        // The replayed request was `blob + checked[stripped..] + new items`;
+        // the explicit remainder of the old checked prefix must still lead
+        // the tail, or this completion belongs to some other history.
         if state.encrypted_content != replayed_blob
             || check_shape(state, request, envelope, tail).is_err()
+            || !starts_with_digests(tail, &state.checked[state.stripped..])
         {
             remove_state(registry, owner);
             return CaptureOutcome::Discarded(DiscardReason::ReplayMismatch);
@@ -271,21 +292,25 @@ pub fn capture_context_blob(
             state.updated_at = now;
             return CaptureOutcome::Retained;
         }
-        covered.extend_from_slice(&state.covered);
+        checked.extend_from_slice(&state.checked[..state.stripped]);
+        stripped = state.stripped;
     }
     let Some(compaction) = compaction else {
         return CaptureOutcome::Skipped;
     };
-    let Some(covered_output) = output_items.get(..compaction.covered_output_items) else {
+    if compaction.covered_output_items > output_items.len() {
         return CaptureOutcome::Refused("covered_output_beyond_items");
-    };
-    if !covered_output.iter().all(round_trips_exactly) {
+    }
+    if !output_items.iter().all(round_trips_exactly) {
         return CaptureOutcome::Refused("unsupported_output_item");
     }
-    covered.extend(tail.iter().map(item_digest));
-    covered.extend(covered_output.iter().map(item_digest));
+    // The new blob holds everything the request carried (the old blob's
+    // content and the explicit tail) plus the output emitted before it.
+    checked.extend(tail.iter().map(item_digest));
+    checked.extend(output_items.iter().map(item_digest));
+    stripped += tail.len() + compaction.covered_output_items;
 
-    if compaction.encrypted_content.len() > MAX_BLOB_BYTES || covered.len() > MAX_COVERED_ITEMS {
+    if compaction.encrypted_content.len() > MAX_BLOB_BYTES || checked.len() > MAX_COVERED_ITEMS {
         remove_state(registry, owner);
         return CaptureOutcome::Discarded(DiscardReason::TooLarge);
     }
@@ -293,12 +318,14 @@ pub fn capture_context_blob(
         model: request.model.clone(),
         prompt_signature: prompt_signature(request),
         envelope: envelope_digests,
-        covered,
+        checked,
+        stripped,
         encrypted_content: compaction.encrypted_content.clone(),
         updated_at: now,
     };
     let outcome = CaptureOutcome::Captured {
-        covered_items: state.covered.len(),
+        checked_items: state.checked.len(),
+        stripped_items: state.stripped,
         blob_bytes: compaction.encrypted_content.len(),
         chained: replayed_blob.is_some(),
     };
@@ -379,6 +406,14 @@ fn item_digest(item: &ResponsesInputItem) -> ItemDigest {
     Sha256::digest(stable_json(&canonical_input_item(item))).into()
 }
 
+fn starts_with_digests(items: &[ResponsesInputItem], digests: &[ItemDigest]) -> bool {
+    items.len() >= digests.len()
+        && items
+            .iter()
+            .zip(digests)
+            .all(|(item, digest)| item_digest(item) == *digest)
+}
+
 fn state_size(owner: &ConversationIdentity, state: &ContextState) -> usize {
     let owner_len = match owner {
         ConversationIdentity::Main(session) => session.len(),
@@ -387,7 +422,7 @@ fn state_size(owner: &ConversationIdentity, state: &ContextState) -> usize {
     owner_len
         + state.model.len()
         + state.prompt_signature.len()
-        + (state.envelope.len() + state.covered.len()) * std::mem::size_of::<ItemDigest>()
+        + (state.envelope.len() + state.checked.len()) * std::mem::size_of::<ItemDigest>()
         + state.encrypted_content.len()
 }
 
@@ -553,7 +588,8 @@ mod tests {
         assert_eq!(
             captured(json!([user("one"), assistant("two")]), "blob-1"),
             CaptureOutcome::Captured {
-                covered_items: 2,
+                checked_items: 2,
+                stripped_items: 2,
                 blob_bytes: 6,
                 chained: false
             }
@@ -614,7 +650,8 @@ mod tests {
                 Some(&blob("blob-2", 1)),
             ),
             CaptureOutcome::Captured {
-                covered_items: 4,
+                checked_items: 4,
+                stripped_items: 4,
                 blob_bytes: 6,
                 chained: true
             }
@@ -631,13 +668,88 @@ mod tests {
     }
 
     #[test]
+    fn chained_capture_keeps_unstripped_output_explicit_and_checked() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_context_management_for_tests();
+        captured(json!([user("one")]), "blob-1");
+        let next = request(json!([user("one"), user("two")]));
+        let ReplayOutcome::Replayed(replay) = apply_context_replay(Some(&owner()), &next) else {
+            panic!("expected a replay");
+        };
+        // blob-2 was emitted before the reply: the reply is checked, not
+        // stripped.
+        let turn = turn();
+        assert_eq!(
+            capture_context_blob(
+                Some(&owner()),
+                turn,
+                &replay.request,
+                &items(&[assistant("three")]),
+                Some(&blob("blob-2", 0)),
+            ),
+            CaptureOutcome::Captured {
+                checked_items: 3,
+                stripped_items: 2,
+                blob_bytes: 6,
+                chained: true
+            }
+        );
+        let later = request(json!([
+            user("one"),
+            user("two"),
+            assistant("three"),
+            user("four")
+        ]));
+        let input = replay_input(apply_context_replay(Some(&owner()), &later));
+        assert_eq!(
+            input,
+            vec![compaction("blob-2"), assistant("three"), user("four")]
+        );
+
+        // A third capture chained on that replay extends the stripped part
+        // over the explicit reply, and the prefix stays consistent.
+        let ReplayOutcome::Replayed(replay) = apply_context_replay(Some(&owner()), &later) else {
+            panic!("expected a replay");
+        };
+        let third_turn = begin_context_turn(Some(&owner()));
+        assert_eq!(
+            capture_context_blob(
+                Some(&owner()),
+                third_turn,
+                &replay.request,
+                &items(&[assistant("five")]),
+                Some(&blob("blob-3", 1)),
+            ),
+            CaptureOutcome::Captured {
+                checked_items: 5,
+                stripped_items: 5,
+                blob_bytes: 6,
+                chained: true
+            }
+        );
+        let edited = request(json!([
+            user("one"),
+            user("two"),
+            assistant("edited"),
+            user("four"),
+            assistant("five"),
+            user("six")
+        ]));
+        assert!(matches!(
+            apply_context_replay(Some(&owner()), &edited),
+            ReplayOutcome::Discarded(DiscardReason::NotAppendOnly)
+        ));
+    }
+
+    #[test]
     fn blob_after_output_covers_that_output() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_context_management_for_tests();
         assert_eq!(
             captured_with_output(json!([user("one")]), &[assistant("two")], 1, "blob-1"),
             CaptureOutcome::Captured {
-                covered_items: 2,
+                checked_items: 2,
+                stripped_items: 2,
                 blob_bytes: 6,
                 chained: false
             }
@@ -651,18 +763,23 @@ mod tests {
     fn differing_reply_never_replays_a_blob_that_holds_another_reply() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_context_management_for_tests();
-        captured_with_output(json!([user("one")]), &[assistant("two")], 1, "blob-1");
-        // The client kept a different reply (edit, regeneration, or a
-        // competing turn); the blob holds "two", so it must not be sent.
-        let next = request(json!([user("one"), assistant("other"), user("three")]));
-        assert!(matches!(
-            apply_context_replay(Some(&owner()), &next),
-            ReplayOutcome::Discarded(DiscardReason::NotAppendOnly)
-        ));
-        assert!(matches!(
-            apply_context_replay(Some(&owner()), &next),
-            ReplayOutcome::Unchanged
-        ));
+        // Whether the blob was emitted after the reply (covered 1) or before
+        // it (covered 0), the reply is part of the checked prefix: a blob at
+        // index 0 has been observed to hold the message emitted after it.
+        for covered in [1, 0] {
+            captured_with_output(json!([user("one")]), &[assistant("two")], covered, "blob-1");
+            // The client kept a different reply (edit, regeneration, or a
+            // competing turn); the blob may hold "two", so it must not be sent.
+            let next = request(json!([user("one"), assistant("other"), user("three")]));
+            assert!(matches!(
+                apply_context_replay(Some(&owner()), &next),
+                ReplayOutcome::Discarded(DiscardReason::NotAppendOnly)
+            ));
+            assert!(matches!(
+                apply_context_replay(Some(&owner()), &next),
+                ReplayOutcome::Unchanged
+            ));
+        }
     }
 
     #[test]
@@ -678,17 +795,35 @@ mod tests {
                 "blob-1"
             ),
             CaptureOutcome::Captured {
-                covered_items: 2,
+                checked_items: 3,
+                stripped_items: 2,
                 blob_bytes: 6,
                 chained: false
             }
         );
-        let next = request(json!([user("one"), call, assistant("two"), user("three")]));
+        let next = request(json!([
+            user("one"),
+            call.clone(),
+            assistant("two"),
+            user("three")
+        ]));
         let input = replay_input(apply_context_replay(Some(&owner()), &next));
         assert_eq!(
             input,
             vec![compaction("blob-1"), assistant("two"), user("three")]
         );
+
+        // The explicit reply is still checked: a different one discards.
+        let edited = request(json!([
+            user("one"),
+            call,
+            assistant("edited"),
+            user("three")
+        ]));
+        assert!(matches!(
+            apply_context_replay(Some(&owner()), &edited),
+            ReplayOutcome::Discarded(DiscardReason::NotAppendOnly)
+        ));
     }
 
     #[test]
@@ -707,7 +842,8 @@ mod tests {
                 Some(&blob("blob-new", 1)),
             ),
             CaptureOutcome::Captured {
-                covered_items: 2,
+                checked_items: 2,
+                stripped_items: 2,
                 blob_bytes: 8,
                 chained: false
             }
@@ -734,7 +870,18 @@ mod tests {
         clear_all_context_management_for_tests();
         let output = json!({"type":"function_call_output","call_id":"call-1","output":"ok"});
         assert_eq!(
-            captured_with_output(json!([user("one")]), &[output], 1, "blob-1"),
+            captured_with_output(
+                json!([user("one")]),
+                std::slice::from_ref(&output),
+                1,
+                "blob-1"
+            ),
+            CaptureOutcome::Refused("unsupported_output_item")
+        );
+        // Every output item is part of the checked prefix, so an unsupported
+        // one refuses even when it sits after the blob.
+        assert_eq!(
+            captured_with_output(json!([user("one")]), &[output], 0, "blob-1"),
             CaptureOutcome::Refused("unsupported_output_item")
         );
         assert_eq!(
