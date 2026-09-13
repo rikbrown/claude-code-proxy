@@ -3971,6 +3971,7 @@ mod tests {
             &http_test_context(),
             &first_candidate,
             None,
+            None,
             &first_request,
             &first_response.body,
             first_response.socket_id,
@@ -4001,6 +4002,7 @@ mod tests {
         super::super::update_continuation_from_upstream(
             &http_test_context(),
             &second_candidate,
+            None,
             None,
             &second_request,
             &second_response.body,
@@ -4103,6 +4105,7 @@ mod tests {
         super::super::update_continuation_from_upstream(
             &http_test_context(),
             &first_candidate,
+            None,
             None,
             &first_request,
             &first_response.body,
@@ -4218,6 +4221,7 @@ mod tests {
         super::super::update_continuation_from_upstream(
             &http_test_context(),
             &first_candidate,
+            None,
             None,
             &first_request,
             &first_response.body,

@@ -125,8 +125,19 @@ pub enum ReducerEvent {
         web_search_requests: usize,
         response_id: Option<String>,
         output_items: Vec<ResponsesInputItem>,
-        compaction_encrypted_content: Option<String>,
+        compaction: Option<CompactionOutput>,
     },
+}
+
+/// The last server-side `compaction` output item of a turn, positioned
+/// against the turn's other output items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionOutput {
+    pub encrypted_content: String,
+    /// How many leading entries of `output_items` were emitted before the
+    /// compaction item. The blob stands for those items too; anything emitted
+    /// after it is not inside the blob and must stay explicit.
+    pub covered_output_items: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -136,8 +147,10 @@ pub struct FinishMetadata {
     pub output_items: Vec<ResponsesInputItem>,
     /// The last server-side `compaction` output item of the turn. Kept apart
     /// from `output_items` because the client never echoes it back, so it
-    /// must not enter the append-only continuation transcript.
-    pub compaction_encrypted_content: Option<String>,
+    /// must not enter the append-only continuation transcript. `None` when
+    /// the turn emitted no compaction item or one that could not be
+    /// positioned against the other output items.
+    pub compaction: Option<CompactionOutput>,
 }
 
 enum BlockState {
@@ -243,13 +256,13 @@ pub fn finish_metadata_from_upstream(
             continuation_eligible,
             response_id,
             output_items,
-            compaction_encrypted_content,
+            compaction,
             ..
         } => Some(FinishMetadata {
             continuation_eligible,
             response_id,
             output_items,
-            compaction_encrypted_content,
+            compaction,
         }),
         _ => None,
     }))
@@ -282,7 +295,10 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
     let mut incomplete = false;
-    let mut compaction_encrypted_content: Option<String> = None;
+    // Last compaction item as (output_index, encrypted_content). Set to
+    // `Err(())` once a compaction item cannot be positioned, which makes the
+    // whole turn's compaction unusable rather than guessed.
+    let mut compaction: Result<Option<(usize, String)>, ()> = Ok(None);
     let mut web_search_requests = 0usize;
     let mut _saw_terminal = false;
     let mut event_count = 0usize;
@@ -656,6 +672,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                     partial_json: repaired,
                 });
                 out.push(ReducerEvent::ToolStop { index });
+                let compaction = position_compaction(&compaction, &output_items_by_index);
                 let output_items: Vec<ResponsesInputItem> =
                     output_items_by_index.into_values().collect();
                 out.push(ReducerEvent::Finish {
@@ -666,7 +683,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                     web_search_requests,
                     response_id: None,
                     output_items,
-                    compaction_encrypted_content,
+                    compaction,
                 });
                 return Ok(out);
             }
@@ -697,12 +714,25 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("compaction")
             {
                 // Several compaction items can arrive in one turn; the last
-                // one covers the most history.
-                if let Some(encrypted_content) =
-                    item_val.get("encrypted_content").and_then(|v| v.as_str())
-                {
-                    compaction_encrypted_content = Some(encrypted_content.to_string());
-                }
+                // one covers the most history, including every output item
+                // emitted before it. An item without an output_index, or one
+                // that arrives out of order, cannot be positioned, so the
+                // turn's compaction is dropped rather than guessed.
+                let encrypted_content = item_val
+                    .get("encrypted_content")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let output_index = p.get("output_index").and_then(|v| v.as_u64());
+                compaction = match (compaction, output_index, encrypted_content) {
+                    (Ok(previous), Some(index), Some(encrypted_content))
+                        if previous
+                            .as_ref()
+                            .is_none_or(|(prev, _)| *prev < index as usize) =>
+                    {
+                        Ok(Some((index as usize, encrypted_content)))
+                    }
+                    _ => Err(()),
+                };
                 continue;
             }
 
@@ -868,6 +898,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
         STOP_END_TURN
     };
 
+    let compaction = position_compaction(&compaction, &output_items_by_index);
     let output_items: Vec<ResponsesInputItem> = output_items_by_index.into_values().collect();
 
     out.push(ReducerEvent::Finish {
@@ -878,10 +909,28 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
         web_search_requests,
         response_id,
         output_items,
-        compaction_encrypted_content,
+        compaction,
     });
 
     Ok(out)
+}
+
+/// Pairs the turn's last compaction item with the count of captured output
+/// items that were emitted before it.
+fn position_compaction(
+    compaction: &Result<Option<(usize, String)>, ()>,
+    output_items_by_index: &std::collections::BTreeMap<usize, ResponsesInputItem>,
+) -> Option<CompactionOutput> {
+    let Ok(Some((output_index, encrypted_content))) = compaction else {
+        return None;
+    };
+    Some(CompactionOutput {
+        encrypted_content: encrypted_content.clone(),
+        covered_output_items: output_items_by_index
+            .keys()
+            .take_while(|index| *index < output_index)
+            .count(),
+    })
 }
 
 fn describe_open_blocks(
@@ -1893,5 +1942,103 @@ mod tests {
                 ..
             }] if id == "rs_1" && encrypted_content == "opaque"
         ));
+    }
+
+    fn compaction_turn(compaction_events: &[(Option<u64>, &str)]) -> String {
+        let mut events = String::new();
+        let mut next_index = 0u64;
+        let mut pending = compaction_events.iter();
+        // Layout: [compaction?] message@n [compaction?]
+        if let Some((index, blob)) = pending.next() {
+            let mut payload = json!({"item":{"type":"compaction","encrypted_content":blob}});
+            if let Some(index) = index {
+                payload["output_index"] = json!(index);
+                next_index = index + 1;
+            }
+            events.push_str(&sse("response.output_item.done", payload));
+        }
+        let message_index = next_index;
+        events.push_str(&sse(
+            "response.output_item.added",
+            json!({"output_index":message_index,"item":{"type":"message","id":"msg_1"}}),
+        ));
+        events.push_str(&sse(
+            "response.output_text.delta",
+            json!({"output_index":message_index,"delta":"answer"}),
+        ));
+        events.push_str(&sse(
+            "response.output_item.done",
+            json!({"output_index":message_index,"item":{"type":"message"}}),
+        ));
+        if let Some((index, blob)) = pending.next() {
+            let mut payload = json!({"item":{"type":"compaction","encrypted_content":blob}});
+            if let Some(index) = index {
+                payload["output_index"] = json!(index);
+            }
+            events.push_str(&sse("response.output_item.done", payload));
+        }
+        events.push_str(&sse(
+            "response.completed",
+            json!({"response":{"id":"resp_1","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}}),
+        ));
+        events
+    }
+
+    fn finish_compaction(upstream: &str) -> (Vec<ResponsesInputItem>, Option<CompactionOutput>) {
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let ReducerEvent::Finish {
+            output_items,
+            compaction,
+            ..
+        } = events.last().unwrap()
+        else {
+            panic!("expected Finish");
+        };
+        (output_items.clone(), compaction.clone())
+    }
+
+    #[test]
+    fn compaction_after_message_covers_it_and_last_item_wins() {
+        let (output_items, compaction) = finish_compaction(&compaction_turn(&[
+            (Some(0), "blob-1"),
+            (Some(2), "blob-2"),
+        ]));
+        assert_eq!(output_items.len(), 1);
+        assert_eq!(
+            compaction,
+            Some(CompactionOutput {
+                encrypted_content: "blob-2".to_string(),
+                covered_output_items: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_before_message_leaves_it_uncovered() {
+        let (output_items, compaction) =
+            finish_compaction(&compaction_turn(&[(Some(0), "blob-1")]));
+        assert_eq!(output_items.len(), 1);
+        assert_eq!(
+            compaction,
+            Some(CompactionOutput {
+                encrypted_content: "blob-1".to_string(),
+                covered_output_items: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn unpositionable_compaction_is_dropped() {
+        let (output_items, compaction) =
+            finish_compaction(&compaction_turn(&[(Some(0), "blob-1"), (None, "blob-2")]));
+        assert_eq!(output_items.len(), 1);
+        assert_eq!(compaction, None);
+
+        // Out of order: a later item with a lower index cannot be trusted.
+        let (_, compaction) = finish_compaction(&compaction_turn(&[
+            (Some(5), "blob-1"),
+            (Some(2), "blob-2"),
+        ]));
+        assert_eq!(compaction, None);
     }
 }
