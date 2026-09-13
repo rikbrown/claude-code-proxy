@@ -59,6 +59,10 @@ struct CodexConfig {
     pub previous_response_id: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
+    #[serde(rename = "contextManagement")]
+    pub context_management: Option<bool>,
+    #[serde(rename = "contextManagementThreshold")]
+    pub context_management_threshold: Option<u64>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
     #[serde(rename = "imagesApi")]
@@ -307,6 +311,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_CONTEXT_MANAGEMENT") {
+        out.push("CCP_CODEX_CONTEXT_MANAGEMENT (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD") {
+        out.push("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD (env)".to_string());
+    }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
@@ -354,6 +364,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if let Some(enabled) = codex.context_management {
+                out.push(format!("codex.contextManagement: {enabled}"));
+            }
+            if let Some(threshold) = codex.context_management_threshold {
+                out.push(format!("codex.contextManagementThreshold: {threshold}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -712,6 +728,50 @@ pub fn codex_server_compaction() -> bool {
     false
 }
 
+pub const CODEX_CONTEXT_MANAGEMENT_DEFAULT_THRESHOLD: u64 = 200_000;
+/// The Codex backend rejects `compact_threshold` values below this with HTTP 400.
+pub const CODEX_CONTEXT_MANAGEMENT_MIN_THRESHOLD: u64 = 1_000;
+
+pub fn codex_context_management() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_CONTEXT_MANAGEMENT") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.context_management
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_context_management_threshold() -> u64 {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(threshold) = env
+        .get("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|threshold| *threshold >= CODEX_CONTEXT_MANAGEMENT_MIN_THRESHOLD)
+    {
+        return threshold;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(threshold) = codex
+            .context_management_threshold
+            .filter(|threshold| *threshold >= CODEX_CONTEXT_MANAGEMENT_MIN_THRESHOLD)
+    {
+        return threshold;
+    }
+    CODEX_CONTEXT_MANAGEMENT_DEFAULT_THRESHOLD
+}
+
 pub fn codex_responses_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
@@ -978,6 +1038,8 @@ mod tests {
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
+            std::env::remove_var("CCP_CODEX_CONTEXT_MANAGEMENT");
+            std::env::remove_var("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
@@ -1332,5 +1394,68 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_context_management_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_context_management());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "on");
+            assert!(codex_context_management());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"contextManagement":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_context_management());
+        let _disabled_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "false");
+        assert!(!codex_context_management());
+    }
+
+    #[test]
+    fn codex_context_management_threshold_ignores_values_below_minimum() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(
+            codex_context_management_threshold(),
+            CODEX_CONTEXT_MANAGEMENT_DEFAULT_THRESHOLD
+        );
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"contextManagementThreshold":50000}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_context_management_threshold(), 50_000);
+        {
+            let _threshold_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD", "999");
+            assert_eq!(codex_context_management_threshold(), 50_000);
+        }
+        {
+            let _threshold_env =
+                EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD", "not-a-number");
+            assert_eq!(codex_context_management_threshold(), 50_000);
+        }
+        {
+            let _threshold_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD", " 1000 ");
+            assert_eq!(codex_context_management_threshold(), 1_000);
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"contextManagementThreshold":10}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_context_management_threshold(),
+            CODEX_CONTEXT_MANAGEMENT_DEFAULT_THRESHOLD
+        );
     }
 }

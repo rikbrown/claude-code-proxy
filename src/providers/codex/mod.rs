@@ -2,6 +2,7 @@ pub mod auth;
 pub mod chat_completions;
 pub mod client;
 pub mod compaction;
+pub mod context_management;
 pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
@@ -43,6 +44,9 @@ use self::compaction::{
     CompactionAttempt, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
     begin_compaction, request_compaction, store_compaction,
 };
+use self::context_management::{
+    CaptureOutcome, ReplayOutcome, apply_context_replay, capture_context_blob,
+};
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
     record_continuation_for_owner,
@@ -74,6 +78,7 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 
 pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
+    context_management::clear_session_context(session_id);
 }
 
 pub struct CodexProvider {
@@ -282,6 +287,35 @@ impl CodexProvider {
             compaction_attempt = Some(replay.attempt);
         }
 
+        let context_management_enabled = config::codex_context_management();
+        if !context_management_enabled && let Some(session_id) = ctx.session_id.as_deref() {
+            context_management::clear_session_context(session_id);
+        }
+        if context_management_enabled {
+            match apply_context_replay(conversation_identity.as_ref(), &translated) {
+                ReplayOutcome::Replayed(replay) => {
+                    log_context_management_event(
+                        "context_management_replayed",
+                        &ctx,
+                        &translated.model,
+                        [
+                            ("coveredItems", serde_json::json!(replay.covered_items)),
+                            ("tailItems", serde_json::json!(replay.tail_items)),
+                            ("inputItems", serde_json::json!(replay.request.input.len())),
+                        ],
+                    );
+                    translated = replay.request;
+                }
+                ReplayOutcome::Discarded(reason) => log_context_management_event(
+                    "context_management_discarded",
+                    &ctx,
+                    &translated.model,
+                    [("reason", serde_json::json!(reason.as_str()))],
+                ),
+                ReplayOutcome::Unchanged => {}
+            }
+        }
+
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
         let continuation = continuation_candidate_for_owner(
@@ -465,7 +499,7 @@ impl CodexProvider {
                 );
             }
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                &ctx,
                 &request_continuation,
                 compaction_attempt,
                 &translated,
@@ -497,7 +531,7 @@ impl CodexProvider {
                         );
                     }
                     update_continuation_from_upstream(
-                        ctx.session_id.as_deref(),
+                        &ctx,
                         &request_continuation,
                         compaction_attempt,
                         &translated,
@@ -638,6 +672,55 @@ fn log_compaction_event(
         create_logger("codex").warn(event, Some(fields));
     } else {
         create_logger("codex").info(event, Some(fields));
+    }
+}
+
+/// Metadata only: counts, booleans, and identifiers. Never prompt text, tool
+/// output, or the encrypted blob.
+fn log_context_management_event<const N: usize>(
+    event: &str,
+    ctx: &RequestContext,
+    model: &str,
+    extra: [(&str, serde_json::Value); N],
+) {
+    let mut fields = serde_json::Map::new();
+    fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
+    fields.insert("sessionId".into(), serde_json::json!(ctx.session_id));
+    fields.insert("model".into(), serde_json::json!(model));
+    for (key, value) in extra {
+        fields.insert(key.into(), value);
+    }
+    create_logger("codex").info(event, Some(fields));
+}
+
+fn capture_context_management_blob(
+    ctx: &RequestContext,
+    owner: Option<&ConversationIdentity>,
+    request_body: &translate::request::ResponsesRequest,
+    encrypted_content: Option<&str>,
+) {
+    match capture_context_blob(owner, request_body, encrypted_content) {
+        CaptureOutcome::Captured {
+            covered_items,
+            blob_bytes,
+            chained,
+        } => log_context_management_event(
+            "context_management_blob_captured",
+            ctx,
+            &request_body.model,
+            [
+                ("coveredItems", serde_json::json!(covered_items)),
+                ("blobBytes", serde_json::json!(blob_bytes)),
+                ("chained", serde_json::json!(chained)),
+            ],
+        ),
+        CaptureOutcome::Discarded(reason) => log_context_management_event(
+            "context_management_discarded",
+            ctx,
+            &request_body.model,
+            [("reason", serde_json::json!(reason.as_str()))],
+        ),
+        CaptureOutcome::Retained | CaptureOutcome::Skipped => {}
     }
 }
 
@@ -970,7 +1053,7 @@ async fn live_stream_response_once(
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
+                    &ctx,
                     &request_continuation,
                     compaction.attempt,
                     &request_body,
@@ -993,7 +1076,7 @@ async fn live_stream_response_once(
         }
         if terminal {
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                &ctx,
                 &request_continuation,
                 compaction.attempt,
                 &request_body,
@@ -1193,7 +1276,7 @@ fn remaining_live_stream_response(
                     }
                     if terminal {
                         update_continuation_from_upstream(
-                            ctx.session_id.as_deref(),
+                            &ctx,
                             &request_continuation,
                             compaction.attempt,
                             &request_body,
@@ -1419,7 +1502,7 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
-    session_id: Option<&str>,
+    ctx: &RequestContext,
     continuation: &ContinuationReservation,
     compaction_attempt: Option<CompactionAttempt>,
     request_body: &translate::request::ResponsesRequest,
@@ -1427,6 +1510,7 @@ fn update_continuation_from_upstream(
     socket_id: Option<u64>,
     compact_boundary: bool,
 ) {
+    let session_id = ctx.session_id.as_deref();
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             if compact_boundary {
@@ -1444,6 +1528,14 @@ fn update_continuation_from_upstream(
                 socket_id,
                 &finish.output_items,
             );
+            if config::codex_context_management() {
+                capture_context_management_blob(
+                    ctx,
+                    continuation.owner(),
+                    request_body,
+                    finish.compaction_encrypted_content.as_deref(),
+                );
+            }
         }
         _ => {
             abort_compaction_attempt(session_id, compaction_attempt);
@@ -1673,6 +1765,7 @@ mod tests {
                 format: None,
             },
             reasoning: None,
+            context_management: None,
         }
     }
 
