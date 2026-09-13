@@ -124,10 +124,19 @@ pub fn uses_responses_lite(model: &str) -> bool {
     )
 }
 
-/// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
-/// Responses API resolves it to a `-free` variant and returns 404 (Model not
-/// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
-/// full lane, so luna is upgraded to its nearest full-lane sibling.
+/// Whether a request for `model` runs on the Responses Lite lane. The Lite
+/// lane rejects server-side compaction and serialises tool calls, so the
+/// operator can move every model onto the full Responses API instead.
+pub fn request_uses_responses_lite(model: &str) -> bool {
+    lite_lane(model, config::codex_full_lane())
+}
+
+fn lite_lane(model: &str, full_lane: bool) -> bool {
+    uses_responses_lite(model) && !full_lane
+}
+
+/// Hosted web_search runs on the full Responses lane; luna is upgraded to
+/// its nearest sibling there.
 pub fn full_lane_web_search_model(model: &str) -> &str {
     if model == "gpt-5.6-luna" {
         "gpt-5.6-sol"
@@ -163,6 +172,21 @@ mod tests {
         assert_eq!(full_lane_web_search_model("gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(full_lane_web_search_model("gpt-5.6-terra"), "gpt-5.6-terra");
         assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn full_lane_flag_moves_lite_models_to_the_full_lane() {
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+        ] {
+            assert!(lite_lane(model, false), "{model} defaults to the lite lane");
+            assert!(!lite_lane(model, true), "{model} must leave the lite lane");
+        }
+        assert!(!lite_lane("gpt-5.4", false));
+        assert!(!lite_lane("gpt-5.4", true));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::traffic::{
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
     ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
-    uses_responses_lite,
+    request_uses_responses_lite,
 };
 
 pub struct CodexNativeBackend {
@@ -130,7 +130,7 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     }
 
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite: request_uses_responses_lite(&model) && !hosted_web_search,
         model,
         stream: object
             .get("stream")

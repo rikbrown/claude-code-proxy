@@ -63,6 +63,8 @@ struct CodexConfig {
     pub context_management: Option<bool>,
     #[serde(rename = "contextManagementThreshold")]
     pub context_management_threshold: Option<u64>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
     #[serde(rename = "imagesApi")]
@@ -370,6 +372,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(threshold) = codex.context_management_threshold {
                 out.push(format!("codex.contextManagementThreshold: {threshold}"));
+            }
+            if let Some(enabled) = codex.full_lane {
+                out.push(format!("codex.fullLane: {enabled}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -745,6 +750,25 @@ pub fn codex_context_management() -> bool {
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.context_management
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
     {
         return enabled;
     }
@@ -1416,6 +1440,28 @@ mod tests {
         assert!(codex_context_management());
         let _disabled_env = EnvGuard::set("CCP_CODEX_CONTEXT_MANAGEMENT", "false");
         assert!(!codex_context_management());
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_full_lane());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "on");
+            assert!(codex_full_lane());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        let _disabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        assert!(!codex_full_lane());
     }
 
     #[test]
