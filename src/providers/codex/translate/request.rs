@@ -101,6 +101,14 @@ pub struct ResponsesRequest {
     pub text: ResponsesText,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Vec<ContextManagementEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContextManagementEntry {
+    Compaction { compact_threshold: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +661,7 @@ fn translate_request_inner(
         service_tier: None,
         prompt_cache_key: None,
         reasoning: None,
+        context_management: None,
     };
 
     if opts.use_responses_lite {
@@ -717,6 +726,11 @@ fn translate_request_inner(
         let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
         if let Some(ref tier) = service_tier {
             out.service_tier = Some(tier.clone());
+        }
+        if config::codex_context_management() {
+            out.context_management = Some(vec![ContextManagementEntry::Compaction {
+                compact_threshold: config::codex_context_management_threshold(),
+            }]);
         }
     }
 

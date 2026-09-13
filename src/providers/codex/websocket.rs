@@ -2481,6 +2481,7 @@ mod tests {
                 format: None,
             },
             reasoning: None,
+            context_management: None,
         }
     }
 
