@@ -755,7 +755,8 @@ fn capture_context_management_blob(
         finish.compaction.as_ref(),
     ) {
         CaptureOutcome::Captured {
-            covered_items,
+            checked_items,
+            stripped_items,
             blob_bytes,
             chained,
         } => log_context_management_event(
@@ -763,7 +764,8 @@ fn capture_context_management_blob(
             ctx,
             &request_body.model,
             [
-                ("coveredItems", serde_json::json!(covered_items)),
+                ("checkedItems", serde_json::json!(checked_items)),
+                ("strippedItems", serde_json::json!(stripped_items)),
                 ("blobBytes", serde_json::json!(blob_bytes)),
                 ("chained", serde_json::json!(chained)),
             ],
