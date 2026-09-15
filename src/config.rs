@@ -65,6 +65,8 @@ struct CodexConfig {
     pub context_management_threshold: Option<u64>,
     #[serde(rename = "fullLane")]
     pub full_lane: Option<bool>,
+    #[serde(rename = "headerTimeoutMs")]
+    pub header_timeout_ms: Option<u64>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
     #[serde(rename = "imagesApi")]
@@ -375,6 +377,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.full_lane {
                 out.push(format!("codex.fullLane: {enabled}"));
+            }
+            if let Some(ms) = codex.header_timeout_ms {
+                out.push(format!("codex.headerTimeoutMs: {ms}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -775,6 +780,38 @@ pub fn codex_full_lane() -> bool {
     false
 }
 
+/// How long an HTTP-transport request may wait for the Codex response headers.
+///
+/// The default is the long-standing 60s, which was set for talking to
+/// chatgpt.com directly. Behind a pooling proxy the head can legitimately take
+/// longer, and on the full Responses lane the backend has been observed to hold
+/// the head until the model produces its first output — a long reasoning turn
+/// then trips this timeout and the whole request is re-sent, up to four times,
+/// which is far more expensive than waiting. Values below 1000ms are ignored.
+pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 60_000;
+pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
+
+pub fn codex_header_timeout_ms() -> u64 {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(ms) = env
+        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(ms) = codex
+            .header_timeout_ms
+            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    CODEX_DEFAULT_HEADER_TIMEOUT_MS
+}
+
 pub fn codex_context_management_threshold() -> u64 {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(threshold) = env
@@ -1068,6 +1105,7 @@ mod tests {
             std::env::remove_var("CCP_CODEX_IMAGES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
             std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
+            std::env::remove_var("CCP_CODEX_HEADER_TIMEOUT_MS");
             std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
     }
@@ -1472,6 +1510,36 @@ mod tests {
         assert!(codex_full_lane());
         let _disabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
         assert!(!codex_full_lane());
+    }
+
+    #[test]
+    fn codex_header_timeout_defaults_overrides_and_floors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":300000}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), 300_000);
+        {
+            let _env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "120000");
+            assert_eq!(codex_header_timeout_ms(), 120_000);
+        }
+        // Below the floor is ignored, not clamped: a value that small is a typo,
+        // and silently clamping it would hide the typo behind a working default.
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        let _env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "0");
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
     }
 
     #[test]
