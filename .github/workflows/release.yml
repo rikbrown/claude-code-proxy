@@ -3,6 +3,13 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # This fork does not receive push events: a push to a branch or a tag
+  # raises no workflow run here, so the tag trigger above never fires and
+  # a release would wait forever. Dispatching against the tag gives
+  # github.ref_name the same value the tag trigger would have, so every
+  # version check below behaves identically:
+  #   gh workflow run release.yml --ref v0.1.40-rik.1
+  workflow_dispatch:
 
 permissions:
   contents: write
