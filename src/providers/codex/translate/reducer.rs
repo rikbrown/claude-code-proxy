@@ -1112,6 +1112,12 @@ pub fn map_codex_usage_to_anthropic(
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: cached,
         server_tool_use: None,
+        output_tokens_details: usage
+            .output_tokens_details_reasoning
+            .map(|reasoning_tokens| OutputTokensDetails {
+                reasoning_tokens,
+                thinking_tokens: reasoning_tokens,
+            }),
     };
 
     if let Some(requests) = web_search_requests
@@ -1133,6 +1139,17 @@ pub struct AnthropicUsage {
     pub cache_read_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<WebSearchUsage>,
+    /// Reasoning tokens as reported by Codex. `thinking_tokens` mirrors the
+    /// field name Claude Code records for Anthropic models so per-turn
+    /// accounting in transcripts stays comparable across providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u64,
+    pub thinking_tokens: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1686,6 +1703,27 @@ mod tests {
         assert_eq!(mapped.input_tokens, 80);
         assert_eq!(mapped.output_tokens, 50);
         assert_eq!(mapped.cache_read_input_tokens, 20);
+        assert!(mapped.output_tokens_details.is_none());
+    }
+
+    #[test]
+    fn map_usage_reports_reasoning_as_thinking_tokens() {
+        let usage = CodexUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            input_tokens_details_cached: None,
+            output_tokens_details_reasoning: Some(30),
+        };
+        let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
+        let details = mapped
+            .output_tokens_details
+            .as_ref()
+            .expect("reasoning details");
+        assert_eq!(details.reasoning_tokens, 30);
+        assert_eq!(details.thinking_tokens, 30);
+        let json = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(json["output_tokens_details"]["reasoning_tokens"], 30);
+        assert_eq!(json["output_tokens_details"]["thinking_tokens"], 30);
     }
 
     #[test]
