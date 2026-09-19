@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 #
 # claude-code-proxy installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/rikbrown/claude-code-proxy/rik/main/scripts/install.sh | bash
 #
 # Environment variables:
 #   CLAUDE_CODE_PROXY_VERSION      - Pin a specific version (e.g., v0.1.0)
 #   CLAUDE_CODE_PROXY_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   CLAUDE_CODE_PROXY_REPO         - Install from another repository (default: this fork)
 #
 # Examples:
 #   CLAUDE_CODE_PROXY_VERSION=v0.1.0 bash install.sh
 #   CLAUDE_CODE_PROXY_INSTALL_DIR=/opt/bin bash install.sh
+#   CLAUDE_CODE_PROXY_REPO=raine/claude-code-proxy bash install.sh
 #
 
 set -e
 
 BIN_NAME="claude-code-proxy"
-REPO="raine/claude-code-proxy"
+# This fork publishes its own releases, so the script fetched from this
+# branch installs this fork's builds. Point it back at upstream, or at
+# anyone else's fork, with CLAUDE_CODE_PROXY_REPO.
+REPO="${CLAUDE_CODE_PROXY_REPO:-rikbrown/claude-code-proxy}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -27,20 +27,23 @@ throughput.
 
 ## Quick start with Codex
 
-Install on macOS or Linux:
+Install this fork's build on macOS or Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rikbrown/claude-code-proxy/rik/main/scripts/install.sh | bash
+```
+
+The installer verifies the checksum and, on macOS, clears the quarantine
+attribute a browser download would set. Prefer it to unpacking the tarball by
+hand. Prebuilt artifacts are on
+[Releases](https://github.com/rikbrown/claude-code-proxy/releases): macOS and
+Linux, arm64 and amd64. This fork builds no Windows artifacts.
+
+To install upstream's build instead, use its Homebrew tap:
 
 ```sh
 brew install raine/claude-code-proxy/claude-code-proxy
 ```
-
-Or use the release installer:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
-```
-
-Windows and other prebuilt artifacts are available from
-[GitHub Releases](https://github.com/raine/claude-code-proxy/releases).
 
 Sign in with a **ChatGPT Plus or Pro account**, not an OpenAI API account:
 
