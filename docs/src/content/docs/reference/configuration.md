@@ -29,6 +29,7 @@ These settings configure the proxy process. Claude Code client settings such as 
     "contextManagement": false,
     "contextManagementThreshold": 200000,
     "fullLane": false,
+    "headerTimeoutMs": 300000,
     "responsesApi": false,
     "imagesApi": false,
     "imagesBaseUrl": "https://chatgpt.com/backend-api/codex"
@@ -116,6 +117,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_CONTEXT_MANAGEMENT` | `codex.contextManagement` | `false` | Enables or disables server-side context compaction on every Codex request for standard boolean words. |
 | `CCP_CODEX_CONTEXT_MANAGEMENT_THRESHOLD` | `codex.contextManagementThreshold` | `200000` | Sets the `compact_threshold` in tokens. Values below `1000` are ignored. |
 | `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Sends `gpt-5.6-*` and `gpt-6-*` requests on the full Responses lane instead of Responses Lite for standard boolean words. |
+| `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | How long an HTTP-transport request waits for Codex response headers, in milliseconds. Values below `1000` are ignored. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_BASE_URL` | `codex.imagesBaseUrl` | `https://chatgpt.com/backend-api/codex` | Sets the trusted Codex Images API root; production use is restricted to HTTPS `chatgpt.com/backend-api/codex`. |

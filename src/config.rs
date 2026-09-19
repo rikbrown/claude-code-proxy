@@ -782,13 +782,15 @@ pub fn codex_full_lane() -> bool {
 
 /// How long an HTTP-transport request may wait for the Codex response headers.
 ///
-/// The default is the long-standing 60s, which was set for talking to
-/// chatgpt.com directly. Behind a pooling proxy the head can legitimately take
-/// longer, and on the full Responses lane the backend has been observed to hold
-/// the head until the model produces its first output — a long reasoning turn
-/// then trips this timeout and the whole request is re-sent, up to four times,
-/// which is far more expensive than waiting. Values below 1000ms are ignored.
-pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 60_000;
+/// The default is 300s. Upstream's 60s was set for talking to chatgpt.com
+/// directly with small prompts. The backend holds the head while the model
+/// reasons, so a large-context turn legitimately takes longer — and the timeout
+/// is not transient: the whole request is re-sent, up to four times, each
+/// attempt starting a fresh reasoning run that fails the same way. Measured on
+/// 2026-09-19: 85 failures in a day, every one at 4 × 60s, while the longest
+/// head that succeeded was 55.8s. Waiting is far cheaper than re-sending.
+/// Values below 1000ms are ignored.
+pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
 pub fn codex_header_timeout_ms() -> u64 {
