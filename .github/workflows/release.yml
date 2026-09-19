@@ -45,16 +45,6 @@ jobs:
             platform: linux-arm64
             ext: ""
             archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows-amd64
-            ext: .exe
-            archive: zip
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            ext: .exe
-            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -64,43 +54,20 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked --target ${{ matrix.target }}
-      - name: Verify Unix binary
-        if: runner.os != 'Windows'
+      - name: Verify binary
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           expected="claude-code-proxy ${VERSION#v}"
           actual="$(target/${{ matrix.target }}/release/${BIN_NAME} --version)"
           test "$actual" = "$expected"
-      - name: Verify Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          $expected = "claude-code-proxy $($env:VERSION.TrimStart('v'))"
-          $actual = & "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" --version
-          if ($actual -ne $expected) {
-            Write-Error "expected '$expected', got '$actual'"
-          }
-      - name: Package Unix
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${BIN_NAME}"
           archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
           tar -C dist -czf "$archive" "${BIN_NAME}"
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
-      - name: Package Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
-          $archive = "${env:BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
-          Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath $archive -Force
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          "$hash  $archive" | Out-File -FilePath "${env:BIN_NAME}-${{ matrix.platform }}.sha256" -Encoding ascii
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
@@ -108,20 +75,8 @@ jobs:
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.${{ matrix.archive }}
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
 
-  smoke-windows:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-amd64
-      - shell: pwsh
-        run: |
-          Expand-Archive claude-code-proxy-windows-amd64.zip -DestinationPath .
-          .\claude-code-proxy.exe --version
-
   release:
-    needs: [build, smoke-windows]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -131,14 +86,22 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          # The fork has no RELEASE_TOKEN; the job's own contents:write is enough
+          # to cut a release in this repository.
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           generate_release_notes: true
+          # The fork's versions carry a -rik.N pre-release suffix. Without this
+          # the release can be flagged a pre-release, and /releases/latest -
+          # which scripts/install.sh reads - skips those.
+          prerelease: false
           files: |
             *.tar.gz
-            *.zip
             *.sha256
 
   update-tap:
+    # Only upstream owns the Homebrew tap, and only upstream holds the token
+    # that can push to it.
+    if: github.repository == 'raine/claude-code-proxy'
     needs: release
     runs-on: ubuntu-latest
     steps:
