@@ -5,6 +5,8 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex users can select GPT-6 Sol with `gpt-6-sol` or its priority-tier
+  `gpt-6-sol-fast` alias.
 - Long Codex requests on the HTTP transport no longer hang for minutes and then
   fail: the proxy waits five minutes for the response headers instead of one,
   configurable with `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs`,
