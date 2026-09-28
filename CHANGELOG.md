@@ -3,6 +3,13 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- A Codex subagent that ends its turn with an empty reply after its
+  `SubagentHandback` tool result now gets a normal empty `end_turn` response
+  instead of ten full-context retries and a 503, so Claude Code no longer marks
+  the subagent as failed after its report was delivered.
+
 ## v0.1.47 (2026-10-25)
 
 - Grok requests no longer fail with HTTP 502 because of the outdated default
