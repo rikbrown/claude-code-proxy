@@ -70,6 +70,9 @@ pub(crate) use self::translate::request::compact_request_signals;
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
+/// Claude Code's subagent report tool. A subagent is told to call it last and
+/// then stop, so an empty completion after its result ends the turn.
+const SUBAGENT_HANDBACK_TOOL_NAME: &str = "SubagentHandback";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
@@ -225,6 +228,10 @@ impl CodexProvider {
                 );
             }
         };
+
+        // Decided before compaction and context replay: either can replace
+        // the `function_call` the last output answers with a compaction item.
+        let empty_completion_ends_turn = ends_with_subagent_handback_result(&translated);
 
         let compact_boundary = is_compact_messages_request(&body);
         if compact_boundary {
@@ -397,6 +404,7 @@ impl CodexProvider {
                     context_turn,
                 },
                 configured_transport,
+                empty_completion_ends_turn,
             )
             .await;
             log.info(
@@ -450,6 +458,10 @@ impl CodexProvider {
                 }
             };
             if !is_empty_codex_success_completion(&response.body) {
+                break response;
+            }
+            if empty_completion_ends_turn {
+                log_empty_completion_after_handback(&ctx);
                 break response;
             }
             // A successful terminal event with no output would translate into
@@ -907,6 +919,7 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    empty_completion_ends_turn: bool,
 ) -> Response {
     let model = model.to_string();
     let request_continuation = continuation.clone();
@@ -979,6 +992,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            empty_completion_ends_turn,
         )
         .await
         {
@@ -1044,6 +1058,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    empty_completion_ends_turn: bool,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -1127,7 +1142,10 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
-            return provider_retry(&upstream_events, empty_live_completion_error());
+            if !empty_completion_ends_turn {
+                return provider_retry(&upstream_events, empty_live_completion_error());
+            }
+            log_empty_completion_after_handback(&ctx);
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -1187,6 +1205,37 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
+}
+
+/// True when the request's last input answers a `SubagentHandback` call made
+/// in the same request. Claude Code tells a subagent to stop after that call,
+/// so an empty completion is the end of its turn, not a lost reply.
+fn ends_with_subagent_handback_result(request: &ResponsesRequest) -> bool {
+    use self::translate::request::ResponsesInputItem;
+
+    let Some(ResponsesInputItem::FunctionCallOutput { call_id, .. }) = request.input.last() else {
+        return false;
+    };
+    request.input.iter().any(|item| {
+        matches!(
+            item,
+            ResponsesInputItem::FunctionCall { call_id: called, name, .. }
+                if called == call_id && name == SUBAGENT_HANDBACK_TOOL_NAME
+        )
+    })
+}
+
+fn log_empty_completion_after_handback(ctx: &RequestContext) {
+    create_logger("codex").info(
+        "empty_completion_after_handback",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+            (
+                "tool".to_string(),
+                serde_json::json!(SUBAGENT_HANDBACK_TOOL_NAME),
+            ),
+        ])),
+    );
 }
 
 fn empty_live_completion_error() -> client::CodexError {
@@ -1967,6 +2016,102 @@ mod tests {
         bytes
     }
 
+    fn request_with_input(input: Vec<translate::request::ResponsesInputItem>) -> ResponsesRequest {
+        let mut request = translate_request(
+            &serde_json::from_value::<MessagesRequest>(serde_json::json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "messages": [{"role":"user","content":"hello"}]
+            }))
+            .unwrap(),
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.5".to_string(),
+                use_responses_lite: false,
+            },
+        )
+        .unwrap();
+        request.input = input;
+        request
+    }
+
+    fn function_call(call_id: &str, name: &str) -> translate::request::ResponsesInputItem {
+        translate::request::ResponsesInputItem::FunctionCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    fn function_call_output(call_id: &str) -> translate::request::ResponsesInputItem {
+        translate::request::ResponsesInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: translate::request::ResponsesFunctionCallOutput::Text("ok".to_string()),
+        }
+    }
+
+    fn user_message(text: &str) -> translate::request::ResponsesInputItem {
+        translate::request::ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![translate::request::ResponsesContentPart::InputText {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn handback_result_as_last_input_ends_turn_on_empty_completion() {
+        let request = request_with_input(vec![
+            user_message("do the work"),
+            function_call("call_1", SUBAGENT_HANDBACK_TOOL_NAME),
+            function_call_output("call_1"),
+        ]);
+        assert!(ends_with_subagent_handback_result(&request));
+    }
+
+    #[test]
+    fn ordinary_tool_result_as_last_input_does_not_end_turn() {
+        let request = request_with_input(vec![
+            user_message("do the work"),
+            function_call("call_1", "Bash"),
+            function_call_output("call_1"),
+        ]);
+        assert!(!ends_with_subagent_handback_result(&request));
+    }
+
+    #[test]
+    fn handback_result_followed_by_user_text_does_not_end_turn() {
+        let request = request_with_input(vec![
+            function_call("call_1", SUBAGENT_HANDBACK_TOOL_NAME),
+            function_call_output("call_1"),
+            user_message("one more thing"),
+        ]);
+        assert!(!ends_with_subagent_handback_result(&request));
+    }
+
+    #[test]
+    fn handback_result_must_answer_a_handback_call_in_the_request() {
+        let orphan = request_with_input(vec![user_message("x"), function_call_output("call_1")]);
+        assert!(!ends_with_subagent_handback_result(&orphan));
+
+        let other_call_id = request_with_input(vec![
+            function_call("call_1", SUBAGENT_HANDBACK_TOOL_NAME),
+            function_call("call_2", "Bash"),
+            function_call_output("call_2"),
+        ]);
+        assert!(!ends_with_subagent_handback_result(&other_call_id));
+    }
+
+    #[test]
+    fn handback_tool_name_matches_exactly() {
+        let request = request_with_input(vec![
+            function_call("call_1", "subagenthandback"),
+            function_call_output("call_1"),
+        ]);
+        assert!(!ends_with_subagent_handback_result(&request));
+    }
+
     #[test]
     fn terminal_only_completed_upstream_is_empty_completion() {
         let body = upstream_sse(&[serde_json::json!({
@@ -2206,6 +2351,7 @@ mod tests {
                 attempt: None,
                 context_turn: None,
             },
+            false,
         )
         .await
         {
@@ -2477,6 +2623,7 @@ mod tests {
                     context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2593,6 +2740,7 @@ mod tests {
                     context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });
@@ -2679,6 +2827,7 @@ mod tests {
                     context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2866,6 +3015,7 @@ mod tests {
                     context_turn: None,
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });

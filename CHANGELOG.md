@@ -5,6 +5,10 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- A Codex subagent that ends its turn with an empty reply after its
+  `SubagentHandback` tool result now gets a normal empty `end_turn` response
+  instead of ten full-context retries and a 503, so Claude Code no longer marks
+  the subagent as failed after its report was delivered.
 - Codex users can select GPT-6 Sol and GPT-6 Luna with `gpt-6-sol` and
   `gpt-6-luna`, or their priority-tier `-fast` aliases.
 - Long Codex requests on the HTTP transport no longer hang for minutes and then
