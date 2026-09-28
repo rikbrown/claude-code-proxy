@@ -3613,3 +3613,367 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     traffic_file(&files, "032-upstream-response-body.sse");
     traffic_file(&files, "040-upstream-event.json");
 }
+
+// ---------------------------------------------------------------------------
+// Empty completion after a SubagentHandback tool result
+// ---------------------------------------------------------------------------
+
+/// Messages whose last input is the tool result of a `tool_name` call.
+fn tool_result_turn_messages(tool_name: &str) -> Value {
+    json!([
+        {"role":"user","content":"do the work"},
+        {"role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_handback","name":tool_name,"input":{"message":"report"}}
+        ]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_handback",
+             "content":"{\"success\":true,\"message\":\"Report delivered to your caller.\"}"}
+        ]}
+    ])
+}
+
+/// The events Codex sends for a `final_answer` message whose text is empty.
+fn empty_final_answer_events() -> Vec<Value> {
+    vec![
+        json!({"type":"response.created","response":{"id":"resp_empty","status":"in_progress"}}),
+        json!({"type":"response.in_progress","response":{"id":"resp_empty","status":"in_progress"}}),
+        json!({"type":"response.output_item.added","output_index":0,
+               "item":{"type":"message","id":"msg_empty","role":"assistant","phase":"final_answer","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"msg_empty",
+               "content_index":0,"part":{"type":"output_text","text":""}}),
+        json!({"type":"response.output_text.done","output_index":0,"item_id":"msg_empty",
+               "content_index":0,"text":""}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"msg_empty",
+               "content_index":0,"part":{"type":"output_text","text":""}}),
+        json!({"type":"response.output_item.done","output_index":0,
+               "item":{"type":"message","id":"msg_empty","role":"assistant","phase":"final_answer",
+                       "content":[{"type":"output_text","text":""}]}}),
+        json!({"type":"response.completed","response":{"id":"resp_empty","status":"completed",
+               "incomplete_details":null,"output":[],
+               "usage":{"input_tokens":5,"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0}}}}),
+    ]
+}
+
+fn empty_final_answer_sse() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for event in empty_final_answer_events() {
+        bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
+    }
+    bytes
+}
+
+/// Upstream that answers every request with `events`.
+async fn spawn_websocket_fixed_events_upstream(
+    request_count: Arc<AtomicUsize>,
+    events: Vec<Value>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+    let events = Arc::new(events);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+            let request_count = request_count.clone();
+            let events = events.clone();
+
+            tokio::spawn(async move {
+                while let Some(message) = receiver.next().await {
+                    match message {
+                        Ok(Message::Text(_)) => {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            for event in events.iter() {
+                                if sender.send(Message::Text(event.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+    });
+
+    addr_str
+}
+
+fn assert_empty_end_turn_sse(body_text: &str) {
+    assert!(
+        body_text.contains(r#""type":"message_start""#),
+        "expected message_start: {body_text}"
+    );
+    assert!(
+        body_text.contains(r#""stop_reason":"end_turn""#),
+        "expected end_turn: {body_text}"
+    );
+    assert!(
+        body_text.contains(r#""type":"message_stop""#),
+        "expected message_stop: {body_text}"
+    );
+    // The live translator opens a text block when the message item arrives,
+    // so an empty message leaves an empty block. No text may follow it.
+    assert!(
+        !body_text.contains("text_delta"),
+        "expected no text: {body_text}"
+    );
+    assert!(
+        !body_text.contains("tool_use"),
+        "expected no tool call: {body_text}"
+    );
+}
+
+async fn call_websocket_tool_result_turn(tool_name: &str) -> (StatusCode, String) {
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": tool_result_turn_messages(tool_name)
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_empty_final_answer_after_subagent_handback_ends_turn() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_fixed_events_upstream(request_count.clone(), empty_final_answer_events())
+            .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let (status, body_text) = call_websocket_tool_result_turn("SubagentHandback").await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    assert_empty_end_turn_sse(&body_text);
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        1,
+        "an empty reply after SubagentHandback must not retry"
+    );
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_terminal_only_completion_after_subagent_handback_ends_turn() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let terminal_only = vec![json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_empty",
+            "status": "completed",
+            "incomplete_details": null,
+            "usage": {"input_tokens": 5, "output_tokens": 0}
+        }
+    })];
+    let upstream =
+        spawn_websocket_fixed_events_upstream(request_count.clone(), terminal_only).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let (status, body_text) = call_websocket_tool_result_turn("SubagentHandback").await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    assert_empty_end_turn_sse(&body_text);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_empty_final_answer_after_ordinary_tool_result_exhausts() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_fixed_events_upstream(request_count.clone(), empty_final_answer_events())
+            .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let (status, body_text) = call_websocket_tool_result_turn("Bash").await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an empty reply after an ordinary tool result must still fail: {body_text}"
+    );
+    assert!(
+        body_text.contains("Codex completed without producing output"),
+        "unexpected exhaustion body: {body_text}"
+    );
+    // Initial attempt plus MAX_RETRYABLE_LIVE_STREAM_RETRIES full-context retries.
+    assert_eq!(request_count.load(Ordering::SeqCst), 11);
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_empty_final_answer_after_subagent_handback_ends_turn() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            empty_final_answer_sse()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": tool_result_turn_messages("SubagentHandback")
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["stop_reason"], "end_turn");
+    assert_eq!(value["content"], json!([]));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_stream_empty_final_answer_after_subagent_handback_ends_turn() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            empty_final_answer_sse()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": tool_result_turn_messages("SubagentHandback")
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    assert_empty_end_turn_sse(&body_text);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_empty_final_answer_after_ordinary_tool_result_exhausts() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            empty_final_answer_sse()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": tool_result_turn_messages("Bash")
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body_text}");
+    assert!(body_text.contains("Codex completed without producing output"));
+    // Initial attempt plus MAX_EMPTY_COMPLETION_RETRIES retries.
+    assert_eq!(attempts.load(Ordering::SeqCst), 11);
+}
