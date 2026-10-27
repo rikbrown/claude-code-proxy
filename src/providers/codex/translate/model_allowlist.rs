@@ -233,6 +233,7 @@ mod tests {
             "gpt-6-luna",
             "gpt-6-sol",
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
         ] {
             assert!(lite_lane(model, false), "{model} defaults to the lite lane");
             assert!(!lite_lane(model, true), "{model} must leave the lite lane");
