@@ -28,6 +28,10 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+`gpt-6.2-sol` and `gpt-6.2-astra` are built-in models, including their `-fast`
+variants. They use Responses Lite; the `fullLane` setting does not switch them
+to the full lane.
+
 Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
@@ -121,7 +125,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 Codex can also compact a conversation on the server while it answers. With context management enabled, a Codex request on the full Responses lane carries `context_management` with a `compaction` entry and a token threshold. When the rendered window crosses that threshold, Codex compacts mid-stream and returns an opaque encrypted `compaction` item alongside the normal answer. Unlike server compaction, this needs no extra request and does not wait for a Claude Code compaction boundary.
 
 :::caution
-The Responses Lite lane rejects server-side compaction (`X-OpenAI-Internal-Codex-Responses-Lite does not support server-side compaction`). The proxy serves `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, and `gpt-6.1-terra` on that lane, so context management is unavailable on the default `gpt-5.6-*`, `gpt-6-*`, and `gpt-6.1-*` routes. Requests for those models are sent without `context_management`, and no compaction item is captured or replayed for them. Only full-lane models such as `gpt-5.5` use the feature. A `context_management_unsupported_lane` log event is written once per process when the feature is enabled but the request runs on the Lite lane.
+The Responses Lite lane rejects server-side compaction (`X-OpenAI-Internal-Codex-Responses-Lite does not support server-side compaction`). The proxy serves `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-astra`, and `gpt-6.2-sol` on that lane, so context management is unavailable on the default `gpt-5.6-*`, `gpt-6-*`, `gpt-6.1-*`, and `gpt-6.2-*` routes. Requests for those models are sent without `context_management`, and no compaction item is captured or replayed for them. Only full-lane models such as `gpt-5.5` use the feature. A `context_management_unsupported_lane` log event is written once per process when the feature is enabled but the request runs on the Lite lane.
 
 `codex.fullLane` or `CCP_CODEX_FULL_LANE` moves those models onto the full Responses lane, where context management is available. It is off by default. On the full lane the proxy identifies itself as `claude-code-proxy` instead of `codex_cli_rs`, and `parallel_tool_calls` is no longer forced off, so the model may return several tool calls in one turn. Hosted `web_search` requests already use the full lane without this setting.
 :::

@@ -17,6 +17,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -169,18 +171,26 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-sol"
             | "gpt-6.1-sol"
             | "gpt-6.1-terra"
+            | "gpt-6.2-astra"
+            | "gpt-6.2-sol"
     )
 }
 
 /// Whether a request for `model` runs on the Responses Lite lane. The Lite
 /// lane rejects server-side compaction and serialises tool calls, so the
-/// operator can move every model onto the full Responses API instead.
+/// operator can move the models onto the full Responses API instead, except
+/// the ones in [`lite_only`].
 pub fn request_uses_responses_lite(model: &str) -> bool {
     lite_lane(model, config::codex_full_lane())
 }
 
 fn lite_lane(model: &str, full_lane: bool) -> bool {
-    uses_responses_lite(model) && !full_lane
+    uses_responses_lite(model) && (!full_lane || lite_only(model))
+}
+
+/// Models that stay on the Responses Lite lane when `fullLane` is set.
+fn lite_only(model: &str) -> bool {
+    matches!(model, "gpt-6.2-astra" | "gpt-6.2-sol")
 }
 
 /// Hosted web_search runs on the full Responses lane; luna is upgraded to
@@ -238,6 +248,10 @@ mod tests {
             assert!(lite_lane(model, false), "{model} defaults to the lite lane");
             assert!(!lite_lane(model, true), "{model} must leave the lite lane");
         }
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            assert!(lite_lane(model, false), "{model} defaults to the lite lane");
+            assert!(lite_lane(model, true), "{model} stays on the lite lane");
+        }
         assert!(!lite_lane("gpt-5.4", false));
         assert!(!lite_lane("gpt-5.4", true));
     }
@@ -277,8 +291,14 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_fast_adds_priority() {
-        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"] {
+    fn gpt_6_fast_adds_priority() {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ] {
             let r = resolve_model_request(&format!("{model}-fast"));
             assert_eq!(r.model, model);
             assert_eq!(r.service_tier, Some(ServiceTier::Priority));
@@ -291,6 +311,8 @@ mod tests {
         assert!(uses_responses_lite("gpt-6-luna"));
         assert!(uses_responses_lite("gpt-6.1-sol"));
         assert!(uses_responses_lite("gpt-6.1-terra"));
+        assert!(uses_responses_lite("gpt-6.2-astra"));
+        assert!(uses_responses_lite("gpt-6.2-sol"));
     }
 
     #[test]
@@ -454,6 +476,8 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
         assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+        assert!(assert_allowed_model("gpt-6.2-astra").is_ok());
+        assert!(assert_allowed_model("gpt-6.2-sol").is_ok());
     }
 
     #[test]
